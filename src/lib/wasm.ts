@@ -17,6 +17,10 @@ const candidates: Array<{ file: string; flavor: WasmKernelFlavor }> = [
   { file: "neuron_kernel.wasm", flavor: "scalar" },
 ];
 
+// Public Wasm files keep stable names, so bump this value whenever the kernel
+// changes to prevent browsers and CDNs from reusing an older implementation.
+const kernelVersion = "20260724-bce-f32-1";
+
 export function applyWasmMathMode(
   exports: MathModeWasmExports,
   mode: MathMode,
@@ -33,7 +37,9 @@ export async function loadBestWasmKernel<Exports>(
   let lastError: unknown;
   for (const candidate of candidates) {
     try {
-      const response = await fetch(`${import.meta.env.BASE_URL}${candidate.file}`);
+      const response = await fetch(
+        `${import.meta.env.BASE_URL}${candidate.file}?v=${kernelVersion}`,
+      );
       if (!response.ok) throw new Error(`无法载入 ${candidate.file}`);
       const { instance } = await WebAssembly.instantiate(await response.arrayBuffer(), {});
       const exports = instance.exports as unknown as Exports;

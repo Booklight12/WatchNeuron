@@ -1178,9 +1178,16 @@ pub export fn train_sample(
         output_delta[index] = probabilities[index] - target;
         if (output_head_kind == 1) {
             var probability = probabilities[index];
-            if (probability < 0.00000001) probability = 0.00000001;
-            if (probability > 0.99999999) probability = 0.99999999;
-            loss -= (target * mathLog(probability) + (1.0 - target) * mathLog(1.0 - probability)) / @as(f32, @floatFromInt(output_count));
+            // 1e-8 is below the spacing between adjacent f32 values around 1,
+            // so 0.99999999 rounds back to 1.0 and makes log(1 - p) infinite.
+            // Branching on the binary target also avoids the undefined
+            // 0 * log(0) form when a sigmoid output is fully saturated.
+            if (probability < 0.000001) probability = 0.000001;
+            if (probability > 0.999999) probability = 0.999999;
+            loss -= (if (target > 0.5)
+                mathLog(probability)
+            else
+                mathLog(1.0 - probability)) / @as(f32, @floatFromInt(output_count));
             output_delta[index] /= @as(f32, @floatFromInt(output_count));
         }
     }

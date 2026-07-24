@@ -113,6 +113,103 @@ if (simdInstance.exports.math_mode() !== 1) {
 instance.exports.set_math_mode(0);
 simdInstance.exports.set_math_mode(0);
 console.log("Wasm math modes: fast approximation and full precision passed");
+
+function saturatedSigmoidLossProbe(exports) {
+  const { memory: probeMemory, __heap_base: probeHeapBase } = exports;
+  let cursor = align(Number(probeHeapBase.value));
+  const allocate = (bytes, alignment = 16) => {
+    cursor = Math.ceil(cursor / alignment) * alignment;
+    const pointer = cursor;
+    cursor += bytes;
+    return pointer;
+  };
+  const allocateTable = () => allocate(4, 4);
+  const inputSizesPtr = allocateTable();
+  const outputSizesPtr = allocateTable();
+  const activationKindsPtr = allocateTable();
+  const weightPointersPtr = allocateTable();
+  const biasPointersPtr = allocateTable();
+  const activationPointersPtr = allocateTable();
+  const preactivationPointersPtr = allocateTable();
+  const deltaPointersPtr = allocateTable();
+  const weightGradientPointersPtr = allocateTable();
+  const biasGradientPointersPtr = allocateTable();
+  const dropoutRatesPtr = allocateTable();
+  const dropoutMaskPointersPtr = allocateTable();
+  const sampleIndicesPtr = allocate(2, 2);
+  const sampleValuesPtr = allocate(4);
+  const weightsPtr = allocate(2 * 4);
+  const biasesPtr = allocate(2 * 4);
+  const activationsPtr = allocate(2 * 4);
+  const preactivationsPtr = allocate(2 * 4);
+  const deltasPtr = allocate(2 * 4);
+  const weightGradientsPtr = allocate(2 * 4);
+  const biasGradientsPtr = allocate(2 * 4);
+  const dropoutMaskPtr = allocate(2 * 4);
+  const inputGradientPtr = allocate(4);
+  if (cursor > probeMemory.buffer.byteLength) {
+    probeMemory.grow(Math.ceil((cursor - probeMemory.buffer.byteLength) / 65536));
+  }
+  const integers = new Int32Array(probeMemory.buffer);
+  const pointers = new Uint32Array(probeMemory.buffer);
+  const floats = new Float32Array(probeMemory.buffer);
+  integers[inputSizesPtr / 4] = 1;
+  integers[outputSizesPtr / 4] = 2;
+  integers[activationKindsPtr / 4] = 0;
+  pointers[weightPointersPtr / 4] = weightsPtr;
+  pointers[biasPointersPtr / 4] = biasesPtr;
+  pointers[activationPointersPtr / 4] = activationsPtr;
+  pointers[preactivationPointersPtr / 4] = preactivationsPtr;
+  pointers[deltaPointersPtr / 4] = deltasPtr;
+  pointers[weightGradientPointersPtr / 4] = weightGradientsPtr;
+  pointers[biasGradientPointersPtr / 4] = biasGradientsPtr;
+  pointers[dropoutMaskPointersPtr / 4] = dropoutMaskPtr;
+  new Uint16Array(probeMemory.buffer, sampleIndicesPtr, 1)[0] = 0;
+  floats[sampleValuesPtr / 4] = 1;
+  floats.set([100, -100], weightsPtr / 4);
+  floats.fill(0, biasesPtr / 4, biasesPtr / 4 + 2);
+  floats[dropoutRatesPtr / 4] = 0;
+  floats.fill(1, dropoutMaskPtr / 4, dropoutMaskPtr / 4 + 2);
+  exports.set_math_mode(1);
+  const loss = exports.train_sample(
+    1,
+    sampleIndicesPtr,
+    sampleValuesPtr,
+    1,
+    0,
+    inputSizesPtr,
+    outputSizesPtr,
+    activationKindsPtr,
+    weightPointersPtr,
+    biasPointersPtr,
+    activationPointersPtr,
+    preactivationPointersPtr,
+    deltaPointersPtr,
+    weightGradientPointersPtr,
+    biasGradientPointersPtr,
+    1,
+    1,
+    inputGradientPtr,
+    dropoutRatesPtr,
+    dropoutMaskPointersPtr,
+    1,
+    0,
+  );
+  exports.set_math_mode(0);
+  return loss;
+}
+
+const scalarSaturatedSigmoidLoss = saturatedSigmoidLossProbe(instance.exports);
+const simdSaturatedSigmoidLoss = saturatedSigmoidLossProbe(simdInstance.exports);
+if (
+  !Number.isFinite(scalarSaturatedSigmoidLoss) ||
+  !Number.isFinite(simdSaturatedSigmoidLoss)
+) {
+  throw new Error(
+    `Wasm saturated Sigmoid/BCE loss was not finite: scalar=${scalarSaturatedSigmoidLoss}, SIMD=${simdSaturatedSigmoidLoss}`,
+  );
+}
+console.log("Wasm saturated Sigmoid/BCE loss remained finite in scalar and SIMD kernels");
 console.log("Zig/Wasm training exports: segmented Dense forward/backprop + train_sample + Conv2D forward/backprop");
 
 const convInputPtr = align(activationProbePtr + 64);
