@@ -1,0 +1,273 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <title>WatchNeuron WebGPU Probe</title>
+  </head>
+  <body>
+    <pre id="result">running</pre>
+    <script type="module">
+      import { WebGpuBatchExecutor } from "/src/lib/webgpu-batch.ts";
+
+      const result = document.querySelector("#result");
+      try {
+        const optimizer = {
+          kind: "adam",
+          momentum: 0.9,
+          beta1: 0.9,
+          beta2: 0.999,
+          decay: 0.9,
+          epsilon: 1e-8,
+          weightDecay: 0,
+        };
+        const assertClose = (actual, expected, tolerance = 1e-5) => {
+          if (actual.length !== expected.length) {
+            throw new Error(`length mismatch: ${actual.length} !== ${expected.length}`);
+          }
+          actual.forEach((value, index) => {
+            if (Math.abs(value - expected[index]) > tolerance) {
+              throw new Error(`value mismatch at ${index}: ${value} !== ${expected[index]}`);
+            }
+          });
+        };
+        const runTraining = (message, timeoutMs = 120000) => new Promise((resolve, reject) => {
+          const worker = new Worker("/src/workers/training.worker.ts", { type: "module" });
+          const timeout = setTimeout(() => {
+            worker.terminate();
+            reject(new Error(`${message.settings.computeBackend} training worker timed out`));
+          }, timeoutMs);
+          worker.onmessage = (event) => {
+            if (event.data.type === "complete") {
+              clearTimeout(timeout);
+              worker.terminate();
+              resolve({
+                backend: event.data.backend,
+                elapsedMs: event.data.elapsedMs,
+                trainingSamples: event.data.trainingSamples,
+                finite: event.data.model.layers.every((layer) =>
+                  [...layer.weights, ...layer.biases].every(Number.isFinite)),
+              });
+            } else if (event.data.type === "error") {
+              clearTimeout(timeout);
+              worker.terminate();
+              reject(new Error(event.data.message));
+            }
+          };
+          worker.postMessage({ type: "train", datasetUrl: "/mnist-training.bin", ...message });
+        });
+        const executor = await WebGpuBatchExecutor.create();
+        const forward = await executor.denseForward(
+          new Float32Array([1, 2, 3, 4, 5, 6, 7, 8]),
+          new Float32Array([1, 0, 0, 0, 0, 0, 0, 1]),
+          new Float32Array([0, 0]),
+          2,
+          4,
+          2,
+          0,
+          0,
+          1,
+          0,
+          false,
+        );
+        const backward = await executor.denseBackward(
+          new Float32Array([1, 2, 3, 4, 5, 6, 7, 8]),
+          new Float32Array([1, 0, 0, 0, 0, 0, 0, 1]),
+          forward.preactivation,
+          forward.dropoutMask,
+          new Float32Array([1, -1, -1, 1]),
+          2,
+          4,
+          2,
+          0,
+        );
+        const convolution = await executor.convolutionForward(
+          new Float32Array([
+            ...Array.from({ length: 16 }, (_, index) => index + 1),
+            ...Array.from({ length: 16 }, (_, index) => index + 101),
+          ]),
+          new Float32Array([2]),
+          new Float32Array([1]),
+          [2, 4, 4, 1, 1, 1, 1, 0, 0, 1],
+          16,
+        );
+        const pooling = await executor.poolingForward(
+          convolution.output,
+          [2, 4, 4, 1, 2, 2, 2, 2, 0, 0],
+          4,
+        );
+        const poolingBackward = await executor.poolingBackward(
+          new Float32Array(8).fill(1),
+          pooling.indices,
+          [2, 4, 4, 1, 2, 2, 2, 2, 0, 0],
+          16,
+          4,
+        );
+        const loss = await executor.outputLoss(
+          new Float32Array([0, 0, 0, 0]),
+          new Int32Array([0, 1]),
+          2,
+          2,
+          false,
+        );
+        assertClose(Array.from(forward.output), [1, 4, 5, 8]);
+        assertClose(Array.from(backward.inputGradient), [1, 0, 0, -1, -1, 0, 0, 1]);
+        assertClose(Array.from(pooling.output), [13, 17, 29, 33, 213, 217, 229, 233]);
+        assertClose(Array.from(loss.output), [0.5, 0.5, 0.5, 0.5]);
+        const workerResult = await runTraining({
+          mnistEnabled: false,
+          layers: [{ id: "gpu-hidden", units: 4, activation: "relu", dropout: 0 }],
+          convolutions: [],
+          poolings: [],
+          outputHead: "softmax",
+          settings: {
+            epochs: 1,
+            learningRate: 0.003,
+            batchSize: 2,
+            mathMode: "full",
+            computeBackend: "webgpu",
+            optimizer,
+          },
+          customSamples: [
+            { id: "gpu-0", label: 0, split: "training", indices: [0, 1], values: [1, 0.5] },
+            { id: "gpu-1", label: 1, split: "training", indices: [2, 3], values: [1, 0.5] },
+            { id: "gpu-test", label: 0, split: "test", indices: [0, 1], values: [1, 0.5] },
+          ],
+        });
+
+        const benchmarkSamples = Array.from({ length: 72 }, (_, sample) => {
+          const label = sample % 10;
+          const column = (label * 2 + sample) % 24 + 2;
+          const row = (label + Math.floor(sample / 10)) % 24 + 2;
+          const indices = [];
+          const values = [];
+          for (let offset = -2; offset <= 2; offset++) {
+            indices.push(row * 28 + column + offset, (row + offset) * 28 + column);
+            values.push(0.5 + ((sample + offset + 5) % 5) * 0.1, 0.8);
+          }
+          return {
+            id: `benchmark-${sample}`,
+            label,
+            split: sample < 64 ? "training" : "test",
+            indices,
+            values,
+          };
+        });
+        const benchmarkBase = {
+          mnistEnabled: false,
+          layers: [{ id: "benchmark-hidden", units: 64, activation: "relu", dropout: 0 }],
+          convolutions: [
+            {
+              id: "benchmark-conv-a",
+              enabled: true,
+              trainable: true,
+              position: 0,
+              order: 0,
+              filters: 16,
+              kernelSize: 3,
+              stride: 1,
+              padding: 1,
+              activation: "relu",
+              kernels: Array.from({ length: 16 }, (_, filter) =>
+                Array.from({ length: 9 }, (_, index) =>
+                  index === 4 ? 1 : ((filter + index) % 5 - 2) * 0.04)),
+            },
+            {
+              id: "benchmark-conv-b",
+              enabled: true,
+              trainable: true,
+              position: 0,
+              order: 2,
+              filters: 32,
+              kernelSize: 3,
+              stride: 1,
+              padding: 1,
+              activation: "relu",
+              kernels: Array.from({ length: 32 }, (_, filter) =>
+                Array.from({ length: 9 }, (_, index) =>
+                  index === 4 ? 0.5 : ((filter + index) % 7 - 3) * 0.02)),
+            },
+          ],
+          poolings: [
+            {
+              id: "benchmark-pool-a",
+              enabled: true,
+              position: 0,
+              order: 1,
+              kind: "max",
+              kernelSize: 2,
+              stride: 2,
+              padding: 0,
+            },
+            {
+              id: "benchmark-pool-b",
+              enabled: true,
+              position: 0,
+              order: 3,
+              kind: "average",
+              kernelSize: 2,
+              stride: 2,
+              padding: 0,
+            },
+          ],
+          outputHead: "softmax",
+          customSamples: benchmarkSamples,
+        };
+        const webgpuBenchmark = await runTraining({
+          ...benchmarkBase,
+          settings: {
+            epochs: 1,
+            learningRate: 0.003,
+            batchSize: 16,
+            mathMode: "full",
+            computeBackend: "webgpu",
+            optimizer,
+          },
+        });
+        const wasmBenchmark = await runTraining({
+          ...benchmarkBase,
+          settings: {
+            epochs: 1,
+            learningRate: 0.003,
+            batchSize: 16,
+            mathMode: "full",
+            computeBackend: "wasm",
+            optimizer,
+          },
+        });
+        const benchmark = {
+          webgpu: webgpuBenchmark,
+          wasm: wasmBenchmark,
+          speedup: wasmBenchmark.elapsedMs / webgpuBenchmark.elapsedMs,
+        };
+        if (!workerResult.finite || !webgpuBenchmark.finite || !wasmBenchmark.finite) {
+          throw new Error("training produced a non-finite parameter");
+        }
+        if (benchmark.speedup <= 1) {
+          throw new Error(
+            `WebGPU multi-convolution benchmark did not beat SIMD (${benchmark.speedup.toFixed(2)}x)`,
+          );
+        }
+        result.textContent = JSON.stringify({
+          ok: true,
+          adapter: executor.adapterName,
+          forward: Array.from(forward.output),
+          inputGradient: Array.from(backward.inputGradient),
+          weightGradient: Array.from(backward.weightGradient),
+          biasGradient: Array.from(backward.biasGradient),
+          convolution: Array.from(convolution.output),
+          pooling: Array.from(pooling.output),
+          poolingBackward: Array.from(poolingBackward.inputGradient),
+          probabilities: Array.from(loss.output),
+          losses: Array.from(loss.losses),
+          worker: workerResult,
+          benchmark,
+        });
+      } catch (error) {
+        result.textContent = JSON.stringify({
+          ok: false,
+          error: String(error?.stack || error),
+        });
+      }
+    </script>
+  </body>
+</html>

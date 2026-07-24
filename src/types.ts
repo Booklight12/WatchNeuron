@@ -135,6 +135,7 @@ export interface TrainingSettings {
   learningRate: number;
   batchSize: number;
   mathMode: MathMode;
+  computeBackend: ComputeBackend;
   optimizer: OptimizerConfig;
 }
 
@@ -147,11 +148,13 @@ export interface TrainingProfileSettings {
 
 export interface TrainingProfiles {
   mathMode: MathMode;
+  computeBackend: ComputeBackend;
   scratch: TrainingProfileSettings;
   finetune: TrainingProfileSettings;
 }
 
 export type MathMode = "fast" | "full";
+export type ComputeBackend = "wasm" | "webgpu";
 
 export type OptimizerKind = "sgd" | "momentum" | "adam" | "rmsprop" | "adagrad";
 

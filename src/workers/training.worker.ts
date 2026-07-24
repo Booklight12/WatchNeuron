@@ -2,6 +2,7 @@
 
 import type {
   ActivationKind,
+  ComputeBackend,
   ConvolutionConfig,
   ConvolutionLayerData,
   CustomDatasetSample,
@@ -16,6 +17,11 @@ import type {
   PoolingLayerData,
   TrainingSettings,
 } from "../types";
+import {
+  WebGpuBatchExecutor,
+  type WebGpuLayerDescriptor,
+  type WebGpuTrainingGraph,
+} from "../lib/webgpu-batch";
 import {
   convolutionOutputShape,
   modelPoolings,
@@ -216,6 +222,7 @@ interface WasmBatchPoolingRuntime extends WasmBatchLayerBase {
   type: "pool";
   poolingIndex: number;
   indicesPointer: number;
+  indices: Uint32Array;
 }
 
 type WasmBatchLayerRuntime =
@@ -267,8 +274,12 @@ interface WasmTrainingRuntime {
   spatialLayers: WasmSpatialRuntime[];
   batch: WasmBatchRuntime;
   outputHead: OutputHeadKind;
-  backend: "Zig/Wasm SIMD · 快速" | "Zig/Wasm SIMD · 完整" | "Zig/Wasm · 快速" | "Zig/Wasm · 完整";
+  backend: string;
   mathMode: MathMode;
+  computeBackend: ComputeBackend;
+  webgpu: WebGpuBatchExecutor | null;
+  webgpuGraph: WebGpuTrainingGraph | null;
+  webgpuDescriptors: WebGpuLayerDescriptor[] | null;
   step: number;
   sampleStep: number;
   beta1Power: number;
@@ -647,6 +658,8 @@ function createWasmTrainingRuntime(
   mathMode: MathMode,
   flavor: WasmKernelFlavor,
   batchCapacity: number,
+  computeBackend: ComputeBackend,
+  webgpu: WebGpuBatchExecutor | null,
 ): WasmTrainingRuntime {
   applyWasmMathMode(wasm, mathMode);
   const sourceLayers = sourceModel.layers;
@@ -941,6 +954,11 @@ function createWasmTrainingRuntime(
       type: "pool",
       poolingIndex: allocation.poolingIndex!,
       indicesPointer: allocation.indicesPointer,
+      indices: new Uint32Array(
+        buffer,
+        allocation.indicesPointer,
+        normalizedBatchCapacity * allocation.outputSize,
+      ),
     };
   });
 
@@ -980,8 +998,14 @@ function createWasmTrainingRuntime(
       layers: batchLayers,
     },
     outputHead: sourceModel.outputHead === "sigmoid" ? "sigmoid" : "softmax",
-    backend: `${flavor === "simd" ? "Zig/Wasm SIMD" : "Zig/Wasm"} · ${mathMode === "full" ? "完整" : "快速"}`,
+    backend: webgpu
+      ? `Zig/WebGPU · ${mathMode === "full" ? "完整" : "快速"}`
+      : `${flavor === "simd" ? "Zig/Wasm SIMD" : "Zig/Wasm"} · ${mathMode === "full" ? "完整" : "快速"}`,
     mathMode,
+    computeBackend,
+    webgpu,
+    webgpuGraph: null,
+    webgpuDescriptors: null,
     step: 0,
     sampleStep: 0,
     beta1Power: 1,
@@ -1337,6 +1361,188 @@ function forwardFullBatch(
   return outputLayer;
 }
 
+function webGpuLayerDescriptors(runtime: WasmTrainingRuntime): WebGpuLayerDescriptor[] {
+  const dropoutRates = new Float32Array(
+    runtime.wasm.memory.buffer,
+    runtime.pointers.dropoutRates,
+    runtime.model.length,
+  );
+  return runtime.batch.layers.map((layer): WebGpuLayerDescriptor => {
+    if (layer.type === "dense") {
+      const model = runtime.model[layer.layerIndex];
+      return {
+        type: "dense",
+        inputSize: layer.inputSize,
+        outputSize: layer.outputSize,
+        activationKind: activationCodes[model.activation],
+        dropoutRate: dropoutRates[layer.layerIndex],
+        weights: model.weights,
+        biases: model.biases,
+      };
+    }
+    if (layer.type === "conv") {
+      const model = runtime.convolutions[layer.convolutionIndex].model;
+      return {
+        type: "conv",
+        inputSize: layer.inputSize,
+        outputSize: layer.outputSize,
+        activationKind: activationCodes[model.activation],
+        inputWidth: model.inputWidth,
+        inputHeight: model.inputHeight,
+        inputChannels: model.inputChannels,
+        filters: model.filters,
+        kernelSize: model.kernelSize,
+        stride: model.stride,
+        padding: model.padding,
+        trainable: model.trainable,
+        weights: model.weights,
+        biases: model.biases,
+      };
+    }
+    const model = runtime.poolings[layer.poolingIndex].model;
+    const global = model.kind === "globalAverage";
+    return {
+      type: "pool",
+      inputSize: layer.inputSize,
+      outputSize: layer.outputSize,
+      inputWidth: model.inputWidth,
+      inputHeight: model.inputHeight,
+      inputChannels: model.inputChannels,
+      outputWidth: model.outputWidth,
+      outputHeight: model.outputHeight,
+      kernelSize: global ? Math.max(model.inputWidth, model.inputHeight) : Math.max(1, model.kernelSize),
+      stride: global ? 1 : Math.max(1, model.stride),
+      padding: global ? 0 : Math.max(0, model.padding),
+      poolingKind: model.kind === "max" ? 0 : model.kind === "average" ? 1 : 2,
+    };
+  });
+}
+
+async function forwardWebGpuBatch(
+  runtime: WasmTrainingRuntime,
+  samples: SparseSample[],
+  _training: boolean,
+) {
+  const graph = runtime.webgpuGraph;
+  if (!graph) throw new Error("Zig/WebGPU 计算图尚未初始化");
+  const batchSize = samples.length;
+  if (batchSize === 0 || batchSize > runtime.batch.capacity) {
+    throw new Error("WebGPU 批次大小超出张量缓冲区容量");
+  }
+  const input = packNchwBatch(samples);
+  runtime.batch.input.set(input, 0);
+  runtime.batch.labels.set(samples.map(({ label }) => label), 0);
+  const result = await graph.forward(
+    input,
+    runtime.batch.labels.subarray(0, batchSize),
+    batchSize,
+  );
+  const outputLayer = runtime.batch.layers.at(-1);
+  if (!outputLayer || outputLayer.type !== "dense") {
+    throw new Error("Zig/WebGPU 路径缺少输出层");
+  }
+  outputLayer.output.set(result.probabilities);
+  runtime.batch.losses.set(result.losses);
+  return outputLayer;
+}
+
+async function trainWebGpuBatch(
+  runtime: WasmTrainingRuntime,
+  samples: SparseSample[],
+  captureTrace = false,
+) {
+  const graph = runtime.webgpuGraph;
+  if (!graph) throw new Error("Zig/WebGPU 计算图尚未初始化");
+  const batchSize = samples.length;
+  const input = packNchwBatch(samples);
+  runtime.batch.input.set(input, 0);
+  runtime.batch.labels.set(samples.map(({ label }) => label), 0);
+  runtime.sampleStep += batchSize;
+  const result = await graph.train(
+    input,
+    runtime.batch.labels.subarray(0, batchSize),
+    batchSize,
+    runtime.sampleStep >>> 0,
+    captureTrace,
+  );
+  runtime.batch.losses.set(result.losses);
+  for (let index = 0; index < runtime.batch.layers.length; index++) {
+    const layer = runtime.batch.layers[index];
+    const gradient = result.gradients[index];
+    if (!gradient) continue;
+    if (layer.type === "dense") {
+      const model = runtime.model[layer.layerIndex];
+      new Float32Array(
+        runtime.wasm.memory.buffer,
+        pointerAt(runtime, runtime.pointers.weightGradients, layer.layerIndex),
+        model.weights.length,
+      ).set(gradient.weightGradient);
+      new Float32Array(
+        runtime.wasm.memory.buffer,
+        pointerAt(runtime, runtime.pointers.biasGradients, layer.layerIndex),
+        model.biases.length,
+      ).set(gradient.biasGradient);
+      continue;
+    }
+    if (layer.type === "conv") {
+      const convolution = runtime.convolutions[layer.convolutionIndex];
+      const { model, pointers } = convolution;
+      if (model.trainable) {
+        new Float32Array(
+          runtime.wasm.memory.buffer,
+          pointers.weightGradient,
+          model.weights.length,
+        ).set(gradient.weightGradient);
+        new Float32Array(
+          runtime.wasm.memory.buffer,
+          pointers.biasGradient,
+          model.biases.length,
+        ).set(gradient.biasGradient);
+      }
+    }
+  }
+
+  let totalLoss = 0;
+  for (let index = 0; index < batchSize; index++) {
+    const value = result.losses[index];
+    if (!Number.isFinite(value)) throw new Error("Zig/WebGPU 批量训练产生了无效损失");
+    totalLoss += value;
+  }
+  if (!captureTrace) return totalLoss;
+
+  const outputLayer = runtime.batch.layers.at(-1)!;
+  result.outputs.forEach((output, index) => runtime.batch.layers[index].output.set(output));
+  result.deltas.forEach((delta, index) => runtime.batch.layers[index].delta.set(delta));
+  if (result.firstInputGradient) {
+    runtime.batch.layers[0].inputGradient.set(result.firstInputGradient);
+  }
+  const probabilities = result.outputs.at(-1)!;
+  let prediction = 0;
+  for (let index = 1; index < outputLayer.outputSize; index++) {
+    if (probabilities[index] > probabilities[prediction]) prediction = index;
+  }
+  return {
+    batchLoss: totalLoss,
+    loss: runtime.batch.losses[0],
+    activations: [
+      Float32Array.from(runtime.batch.input.subarray(0, 784)),
+      ...result.outputs,
+    ],
+    gradients: [
+      result.firstInputGradient ?? new Float32Array(runtime.batch.layers[0].inputSize),
+      ...result.deltas,
+    ],
+    convolutionWeights: runtime.convolutions.map((convolution) =>
+      Float32Array.from(convolution.model.weights),
+    ),
+    convolutionBiases: runtime.convolutions.map((convolution) =>
+      Float32Array.from(convolution.model.biases),
+    ),
+    label: samples[0].label,
+    prediction,
+  } satisfies FullBatchTraceResult;
+}
+
 function trainFullBatchWithWasm(
   runtime: WasmTrainingRuntime,
   samples: SparseSample[],
@@ -1636,13 +1842,15 @@ function applyBatchUpdates(runtime: WasmTrainingRuntime, learningRate: number, b
   });
 }
 
-function validateWithWasm(runtime: WasmTrainingRuntime, samples: SparseSample[]) {
+async function validateWithWasm(runtime: WasmTrainingRuntime, samples: SparseSample[]) {
   if (samples.length === 0) return 0;
   let correct = 0;
-  if (runtime.mathMode === "full") {
+  if (runtime.mathMode === "full" || runtime.webgpu) {
     for (let start = 0; start < samples.length; start += runtime.batch.capacity) {
       const batchSamples = samples.slice(start, start + runtime.batch.capacity);
-      const outputLayer = forwardFullBatch(runtime, batchSamples, false);
+      const outputLayer = runtime.webgpu
+        ? await forwardWebGpuBatch(runtime, batchSamples, false)
+        : forwardFullBatch(runtime, batchSamples, false);
       for (let batchIndex = 0; batchIndex < batchSamples.length; batchIndex++) {
         const offset = batchIndex * outputLayer.outputSize;
         let prediction = 0;
@@ -1707,16 +1915,26 @@ async function train(message: TrainMessage) {
   const epochs = Number.isFinite(message.settings.epochs)
     ? Math.max(1, Math.floor(message.settings.epochs))
     : 1;
-  postMessage({ type: "progress", phase: "loading", epoch: 0, backend: "Zig/Wasm" });
+  const requestedComputeBackend: ComputeBackend =
+    message.settings.computeBackend === "webgpu" ? "webgpu" : "wasm";
+  postMessage({
+    type: "progress",
+    phase: "loading",
+    epoch: 0,
+    backend: requestedComputeBackend === "webgpu" ? "Zig/WebGPU" : "Zig/Wasm",
+  });
   const datasetPromise = message.mnistEnabled === false
     ? Promise.resolve<ArrayBuffer | null>(null)
     : fetch(message.datasetUrl).then((response) => {
         if (!response.ok) throw new Error("无法载入训练数据");
         return response.arrayBuffer();
       });
-  const [datasetBuffer, loadedWasm] = await Promise.all([
+  const [datasetBuffer, loadedWasm, webgpu] = await Promise.all([
     datasetPromise,
     loadTrainingWasm(),
+    requestedComputeBackend === "webgpu"
+      ? WebGpuBatchExecutor.create()
+      : Promise.resolve(null),
   ]);
   const { training, validation } = datasetBuffer
     ? parseDataset(datasetBuffer)
@@ -1731,7 +1949,10 @@ async function train(message: TrainMessage) {
   const batchSize = Number.isFinite(message.settings.batchSize)
     ? Math.max(1, Math.floor(message.settings.batchSize))
     : 16;
-  const mathMode: MathMode = message.settings.mathMode === "full" ? "full" : "fast";
+  const mathMode: MathMode =
+    requestedComputeBackend === "webgpu" || message.settings.mathMode === "full"
+      ? "full"
+      : "fast";
   const runtime = createWasmTrainingRuntime(
     loadedWasm.exports,
     sourceModel,
@@ -1739,8 +1960,18 @@ async function train(message: TrainMessage) {
     message.settings.optimizer,
     mathMode,
     loadedWasm.flavor,
-    mathMode === "full" ? batchSize : 1,
+    mathMode === "full" || webgpu ? batchSize : 1,
+    requestedComputeBackend,
+    webgpu,
   );
+  if (webgpu) {
+    runtime.webgpuDescriptors = webGpuLayerDescriptors(runtime);
+    runtime.webgpuGraph = webgpu.createTrainingGraph(
+      runtime.webgpuDescriptors,
+      runtime.batch.capacity,
+      runtime.outputHead === "sigmoid",
+    );
+  }
   activeRuntime = runtime;
   if (!Number.isFinite(message.settings.learningRate) || message.settings.learningRate <= 0) {
     throw new Error("学习率必须是大于 0 的有限数值");
@@ -1785,15 +2016,20 @@ async function train(message: TrainMessage) {
     const learningRate =
       message.settings.learningRate * Math.pow(0.94, epoch);
     let loss = 0;
-    if (runtime.mathMode === "full") {
+    if (runtime.mathMode === "full" || runtime.webgpu) {
       for (let batchStart = 0; batchStart < training.length; batchStart += batchSize) {
         const batchSamples = training.slice(batchStart, batchStart + batchSize);
         const now = performance.now();
         const captureTrace =
           batchStart === 0 ||
           (batchStart % traceInterval < batchSize && now - lastTraceAt >= 90);
-        const result = trainFullBatchWithWasm(runtime, batchSamples, captureTrace);
+        const result = runtime.webgpu
+          ? await trainWebGpuBatch(runtime, batchSamples, captureTrace)
+          : trainFullBatchWithWasm(runtime, batchSamples, captureTrace);
         applyBatchUpdates(runtime, learningRate, batchSamples.length);
+        if (runtime.webgpuGraph && runtime.webgpuDescriptors) {
+          runtime.webgpuGraph.uploadParameters(runtime.webgpuDescriptors);
+        }
         if (typeof result === "number") loss += result;
         else {
           loss += result.batchLoss;
@@ -1875,7 +2111,7 @@ async function train(message: TrainMessage) {
         }
       }
     }
-    const accuracy = validateWithWasm(runtime, validation);
+    const accuracy = await validateWithWasm(runtime, validation);
     lastAccuracy = accuracy;
     if (activeSnapshotProgress) {
       activeSnapshotProgress.accuracy = accuracy;
@@ -1900,7 +2136,7 @@ async function train(message: TrainMessage) {
     }
   }
 
-  const accuracy = validateWithWasm(runtime, validation);
+  const accuracy = await validateWithWasm(runtime, validation);
   const completedModel = cloneWasmModel(runtime);
   const transfer = completedModel.layers.flatMap((layer) => [
     layer.weights.buffer,

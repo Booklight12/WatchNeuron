@@ -211,6 +211,7 @@ const trainingModeOptions: SegmentedControlOption[] = [
 const settings = computed<TrainingSettings>(() => ({
   ...props.profiles[selectedMode.value],
   mathMode: props.profiles.mathMode,
+  computeBackend: props.profiles.computeBackend,
   optimizer: { ...props.profiles[selectedMode.value].optimizer },
 }));
 
@@ -280,6 +281,7 @@ function applyDefaultProfiles() {
     learningRate: 0.018,
     batchSize: 16,
     mathMode: props.profiles.mathMode,
+    computeBackend: props.profiles.computeBackend,
     optimizer: baseOptimizer,
   });
   emit("update", "finetune", {
@@ -287,6 +289,7 @@ function applyDefaultProfiles() {
     learningRate: 0.0002,
     batchSize: 16,
     mathMode: props.profiles.mathMode,
+    computeBackend: props.profiles.computeBackend,
     optimizer: { ...baseOptimizer, kind: "adam" },
   });
 }

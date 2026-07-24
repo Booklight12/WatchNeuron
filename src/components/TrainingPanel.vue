@@ -49,9 +49,14 @@ const mathModeOptions: SegmentedControlOption[] = [
   { value: "fast", label: "快速", title: "使用近似数学函数以提高速度" },
   { value: "full", label: "完整", title: "使用标准精度数学函数" },
 ];
+const computeBackendOptions: SegmentedControlOption[] = [
+  { value: "wasm", label: "Zig/Wasm", title: "使用 Zig 编译的 Wasm SIMD/标量内核" },
+  { value: "webgpu", label: "Zig/WebGPU", title: "使用 WGSL 在 GPU 上执行批量张量计算" },
+];
 const settings = computed<TrainingSettings>(() => ({
   ...props.profiles[editingMode.value],
   mathMode: props.profiles.mathMode,
+  computeBackend: props.profiles.computeBackend,
   optimizer: { ...props.profiles[editingMode.value].optimizer },
 }));
 
@@ -61,6 +66,14 @@ function setSetting(key: "epochs" | "learningRate", value: number) {
 
 function setMathMode(mathMode: "fast" | "full") {
   emit("update", editingMode.value, { ...settings.value, mathMode });
+}
+
+function setComputeBackend(computeBackend: "wasm" | "webgpu") {
+  emit("update", editingMode.value, {
+    ...settings.value,
+    computeBackend,
+    mathMode: computeBackend === "webgpu" ? "full" : settings.value.mathMode,
+  });
 }
 
 function setEpochs(value: string) {
@@ -133,7 +146,7 @@ function progressLabel() {
       </div>
       <span class="training-runtime">
         <BrainCircuit :size="14" />
-        {{ backend === "Wasm SIMD" ? "Zig/Wasm SIMD" : "Zig/Wasm" }} · {{ settings.mathMode === "full" ? "完整" : "快速" }}
+        {{ settings.computeBackend === "webgpu" ? "Zig/WebGPU" : backend === "Wasm SIMD" ? "Zig/Wasm SIMD" : "Zig/Wasm" }} · {{ settings.mathMode === "full" ? "完整" : "快速" }}
       </span>
     </div>
 
@@ -157,13 +170,25 @@ function progressLabel() {
     />
 
     <div class="math-mode-setting">
+      <span>张量后端</span>
+      <SegmentedControl
+        class="math-mode-toggle"
+        :model-value="settings.computeBackend"
+        :options="computeBackendOptions"
+        label="Zig 张量计算后端"
+        :disabled="controlsLocked"
+        @update:model-value="setComputeBackend($event as 'wasm' | 'webgpu')"
+      />
+    </div>
+
+    <div class="math-mode-setting">
       <span>数学实现</span>
       <SegmentedControl
         class="math-mode-toggle"
         :model-value="settings.mathMode"
         :options="mathModeOptions"
         label="Zig 数学实现"
-        :disabled="controlsLocked"
+        :disabled="controlsLocked || settings.computeBackend === 'webgpu'"
         @update:model-value="setMathMode($event as 'fast' | 'full')"
       />
     </div>

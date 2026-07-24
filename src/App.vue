@@ -139,6 +139,7 @@ function normalizeTrainingProfile(
 function storedTrainingProfiles(): TrainingProfiles {
   const fallback: TrainingProfiles = {
     mathMode: "fast",
+    computeBackend: "wasm",
     scratch: defaultScratchProfile(),
     finetune: defaultFinetuneProfile(),
   };
@@ -147,7 +148,8 @@ function storedTrainingProfiles(): TrainingProfiles {
     if (!parsed || typeof parsed !== "object") return fallback;
     const isProfileFormat = parsed.scratch && parsed.finetune;
     return {
-      mathMode: parsed.mathMode === "full" ? "full" : "fast",
+      mathMode: parsed.computeBackend === "webgpu" || parsed.mathMode === "full" ? "full" : "fast",
+      computeBackend: parsed.computeBackend === "webgpu" ? "webgpu" : "wasm",
       scratch: normalizeTrainingProfile(
         isProfileFormat ? parsed.scratch : parsed,
         fallback.scratch,
@@ -847,7 +849,8 @@ function updateTrainingSettings(mode: TrainingMode, settings: TrainingSettings) 
   const fallback = mode === "finetune" ? defaultFinetuneProfile() : defaultScratchProfile();
   trainingProfiles.value = {
     ...trainingProfiles.value,
-    mathMode: settings.mathMode === "full" ? "full" : "fast",
+    mathMode: settings.computeBackend === "webgpu" || settings.mathMode === "full" ? "full" : "fast",
+    computeBackend: settings.computeBackend === "webgpu" ? "webgpu" : "wasm",
     [mode]: normalizeTrainingProfile(settings, fallback),
   };
   if (trainingProgress.value.phase === "idle") {
@@ -870,6 +873,7 @@ function startTraining(mode: TrainingMode = "scratch") {
   const settings: TrainingSettings = {
     ...trainingProfiles.value[mode],
     mathMode: trainingProfiles.value.mathMode,
+    computeBackend: trainingProfiles.value.computeBackend,
     optimizer: { ...trainingProfiles.value[mode].optimizer },
   };
   trainingWorker?.terminate();
