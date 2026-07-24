@@ -128,7 +128,7 @@ try {
       biases: new Float32Array(10),
     },
   ];
-  const graph = executor.createTrainingGraph(descriptors, 4, false);
+  const graph = executor.createTrainingGraph(descriptors, 4, false, "full");
   const persistentBufferCount = bufferCount;
   const input = new Float32Array(2 * 784);
   const labels = new Int32Array([0, 1]);
@@ -141,6 +141,12 @@ try {
   assert.equal(bufferCount - persistentBufferCount, 1, "forward graph may allocate only one staging buffer");
   assert.equal(forward.probabilities.length, 20);
   assert.equal(forward.losses.length, 2);
+  assert.ok(
+    [...graph.forwardOperations, graph.lossOperation].every(
+      (operation) => new Uint32Array(operation.parameterBuffer.bytes.buffer)[15] === 1,
+    ),
+    "full graph must encode full math mode in every dispatch",
+  );
 
   const buffersAfterForward = bufferCount;
   const trainingSubmissions = submissionCount;
@@ -166,6 +172,15 @@ try {
   const buffersBeforeUpload = bufferCount;
   graph.uploadParameters(descriptors);
   assert.equal(bufferCount, buffersBeforeUpload, "parameter upload must reuse persistent GPU buffers");
+
+  const fastGraph = executor.createTrainingGraph(descriptors, 4, false, "fast");
+  await fastGraph.forward(input, labels, 2);
+  assert.ok(
+    [...fastGraph.forwardOperations, fastGraph.lossOperation].every(
+      (operation) => new Uint32Array(operation.parameterBuffer.bytes.buffer)[15] === 0,
+    ),
+    "fast graph must encode fast math mode in every dispatch",
+  );
 
   console.log("WebGPU persistent graph verification passed");
 } finally {

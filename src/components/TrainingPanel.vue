@@ -72,7 +72,6 @@ function setComputeBackend(computeBackend: "wasm" | "webgpu") {
   emit("update", editingMode.value, {
     ...settings.value,
     computeBackend,
-    mathMode: computeBackend === "webgpu" ? "full" : settings.value.mathMode,
   });
 }
 
@@ -188,7 +187,7 @@ function progressLabel() {
         :model-value="settings.mathMode"
         :options="mathModeOptions"
         label="Zig 数学实现"
-        :disabled="controlsLocked || settings.computeBackend === 'webgpu'"
+        :disabled="controlsLocked"
         @update:model-value="setMathMode($event as 'fast' | 'full')"
       />
     </div>

@@ -20,12 +20,68 @@ fn pf(index: u32) -> f32 {
   return bitcast<f32>(p(index));
 }
 
+fn fast_exp(raw: f32) -> f32 {
+  if (raw < -12.0) { return 0.000006; }
+  let value = min(raw, 12.0);
+  return bitcast<f32>(u32(12102203.0 * value + 1064866805.0));
+}
+
+fn fast_log(value: f32) -> f32 {
+  var bits = bitcast<u32>(value);
+  let exponent = i32((bits >> 23u) & 255u) - 127;
+  bits = (bits & 0x007fffffu) | 0x3f800000u;
+  let normalized = bitcast<f32>(bits);
+  let ratio = (normalized - 1.0) / (normalized + 1.0);
+  let squared = ratio * ratio;
+  var series = ratio;
+  var power = ratio * squared;
+  series += power / 3.0;
+  power *= squared;
+  series += power / 5.0;
+  power *= squared;
+  series += power / 7.0;
+  power *= squared;
+  series += power / 9.0;
+  return 2.0 * series + f32(exponent) * 0.69314718056;
+}
+
+fn math_exp(value: f32) -> f32 {
+  if (p(15u) == 0u) { return fast_exp(value); }
+  return exp(value);
+}
+
+fn math_log(value: f32) -> f32 {
+  if (p(15u) == 0u) { return fast_log(value); }
+  return log(value);
+}
+
+fn math_tanh(value: f32) -> f32 {
+  if (p(15u) == 0u) {
+    return 2.0 / (1.0 + fast_exp(-2.0 * value)) - 1.0;
+  }
+  if (value > 10.0) { return 1.0; }
+  if (value < -10.0) { return -1.0; }
+  let exponential = exp(2.0 * value);
+  return (exponential - 1.0) / (exponential + 1.0);
+}
+
+fn math_softplus(value: f32) -> f32 {
+  if (p(15u) == 0u) {
+    if (value > 12.0) { return value; }
+    if (value < -12.0) { return fast_exp(value); }
+    return fast_log(1.0 + fast_exp(value));
+  }
+  if (value > 20.0) { return value; }
+  if (value < -20.0) { return exp(value); }
+  return log(1.0 + exp(value));
+}
+
 fn clamp_delta(value: f32) -> f32 {
-  return clamp(value, -1e4, 1e4);
+  return clamp(value, -5.0, 5.0);
 }
 
 fn sigmoid(value: f32) -> f32 {
-  return 1.0 / (1.0 + exp(-value));
+  return 1.0 / (1.0 + math_exp(-value));
 }
 
 fn activation(value: f32, kind: u32) -> f32 {
@@ -33,13 +89,13 @@ fn activation(value: f32, kind: u32) -> f32 {
   if (kind == 1u) { return max(value, 0.0); }
   if (kind == 2u) { return select(value * 0.08, value, value >= 0.0); }
   if (kind == 3u) { return sigmoid(value); }
-  if (kind == 4u) { return tanh(value); }
-  if (kind == 6u) { return select(exp(value) - 1.0, value, value >= 0.0); }
-  if (kind == 7u) { return 1.050700987 * select(1.673263242 * (exp(value) - 1.0), value, value >= 0.0); }
-  if (kind == 8u) { return 0.5 * value * (1.0 + tanh(0.79788456 * (value + 0.044715 * value * value * value))); }
+  if (kind == 4u) { return math_tanh(value); }
+  if (kind == 6u) { return select(math_exp(value) - 1.0, value, value >= 0.0); }
+  if (kind == 7u) { return 1.050700987 * select(1.673263242 * (math_exp(value) - 1.0), value, value >= 0.0); }
+  if (kind == 8u) { return 0.5 * value * (1.0 + math_tanh(0.79788456 * (value + 0.044715 * value * value * value))); }
   if (kind == 9u) { return value * sigmoid(value); }
-  if (kind == 10u) { return value * tanh(log(1.0 + exp(value))); }
-  if (kind == 11u) { return log(1.0 + exp(value)); }
+  if (kind == 10u) { return value * math_tanh(math_softplus(value)); }
+  if (kind == 11u) { return math_softplus(value); }
   if (kind == 12u) { return value / (1.0 + abs(value)); }
   if (kind == 13u) { return clamp(0.2 * value + 0.5, 0.0, 1.0); }
   if (kind == 14u) { return clamp(value, -1.0, 1.0); }
@@ -56,14 +112,14 @@ fn activation_derivative(value: f32, kind: u32) -> f32 {
     return activated * (1.0 - activated);
   }
   if (kind == 4u) {
-    let activated = tanh(value);
+    let activated = math_tanh(value);
     return 1.0 - activated * activated;
   }
-  if (kind == 6u) { return select(exp(value), 1.0, value >= 0.0); }
-  if (kind == 7u) { return 1.050700987 * select(1.673263242 * exp(value), 1.0, value >= 0.0); }
+  if (kind == 6u) { return select(math_exp(value), 1.0, value >= 0.0); }
+  if (kind == 7u) { return 1.050700987 * select(1.673263242 * math_exp(value), 1.0, value >= 0.0); }
   if (kind == 8u) {
     let inner = 0.79788456 * (value + 0.044715 * value * value * value);
-    let t = tanh(inner);
+    let t = math_tanh(inner);
     return 0.5 * (1.0 + t) + 0.5 * value * (1.0 - t * t) * 0.79788456 * (1.0 + 0.134145 * value * value);
   }
   if (kind == 9u) {
@@ -71,8 +127,8 @@ fn activation_derivative(value: f32, kind: u32) -> f32 {
     return s + value * s * (1.0 - s);
   }
   if (kind == 10u) {
-    let softplus = log(1.0 + exp(value));
-    let t = tanh(softplus);
+    let softplus = math_softplus(value);
+    let t = math_tanh(softplus);
     return t + value * sigmoid(value) * (1.0 - t * t);
   }
   if (kind == 11u) { return sigmoid(value); }
@@ -127,9 +183,9 @@ fn dense_forward(@builtin(global_invocation_id) id: vec3<u32>) {
       for (var column = 0u; column < input_size; column++) {
         item_sum += weights.values[item * input_size + column] * input.values[batch * input_size + column];
       }
-      total += exp(item_sum - maximum);
+      total += math_exp(item_sum - maximum);
     }
-    value = exp(sum - maximum) / total;
+    value = math_exp(sum - maximum) / total;
   }
   var mask = 1.0;
   if (p(4u) != 0u) {
@@ -163,9 +219,9 @@ fn output_loss(@builtin(global_invocation_id) id: vec3<u32>) {
     }
     var total = 0.0;
     for (var digit = 0u; digit < output_size; digit++) {
-      total += exp(input.values[batch * output_size + digit] - maximum);
+      total += math_exp(input.values[batch * output_size + digit] - maximum);
     }
-    probability = exp(input.values[index] - maximum) / total;
+    probability = math_exp(input.values[index] - maximum) / total;
   }
   output.values[index] = probability;
   let desired = select(0.0, 1.0, item == label);
@@ -176,7 +232,7 @@ fn output_loss(@builtin(global_invocation_id) id: vec3<u32>) {
       for (var digit = 0u; digit < output_size; digit++) {
         let digit_target = select(0.0, 1.0, digit == label);
         let digit_probability = clamp(sigmoid(input.values[batch * output_size + digit]), 0.000001, 0.999999);
-        loss -= select(log(1.0 - digit_probability), log(digit_probability), digit_target > 0.5) / f32(output_size);
+        loss -= select(math_log(1.0 - digit_probability), math_log(digit_probability), digit_target > 0.5) / f32(output_size);
       }
     } else {
       var maximum = -3.4e38;
@@ -185,10 +241,10 @@ fn output_loss(@builtin(global_invocation_id) id: vec3<u32>) {
       }
       var total = 0.0;
       for (var digit = 0u; digit < output_size; digit++) {
-        total += exp(input.values[batch * output_size + digit] - maximum);
+        total += math_exp(input.values[batch * output_size + digit] - maximum);
       }
-      let label_probability = exp(input.values[batch * output_size + label] - maximum) / total;
-      loss = -log(max(label_probability, 0.00000001));
+      let label_probability = math_exp(input.values[batch * output_size + label] - maximum) / total;
+      loss = -math_log(max(label_probability, 0.00000001));
     }
     output3.values[batch] = loss;
   }
@@ -210,14 +266,14 @@ fn dense_delta(@builtin(global_invocation_id) id: vec3<u32>) {
     }
     var total = 0.0;
     for (var item = 0u; item < output_size; item++) {
-      total += exp(weights.values[batch * output_size + item] - maximum);
+      total += math_exp(weights.values[batch * output_size + item] - maximum);
     }
     var dot = 0.0;
     for (var item = 0u; item < output_size; item++) {
-      let probability = exp(weights.values[batch * output_size + item] - maximum) / total;
+      let probability = math_exp(weights.values[batch * output_size + item] - maximum) / total;
       dot += clamp_delta(input.values[batch * output_size + item]) * probability;
     }
-    let probability = exp(weights.values[index] - maximum) / total;
+    let probability = math_exp(weights.values[index] - maximum) / total;
     gradient = probability * (gradient - dot);
   } else {
     gradient *= biases.values[index] * activation_derivative(weights.values[index], kind);
@@ -318,9 +374,9 @@ fn conv_forward(@builtin(global_invocation_id) id: vec3<u32>) {
     for (var item = 0u; item < sample_size; item++) {
       let item_filter = item / (ow * oh);
       let item_pixel = item % (ow * oh);
-      total += exp(conv_sum(batch, item_filter, item_pixel / ow, item_pixel % ow) - maximum);
+      total += math_exp(conv_sum(batch, item_filter, item_pixel / ow, item_pixel % ow) - maximum);
     }
-    output.values[index] = exp(sum - maximum) / total;
+    output.values[index] = math_exp(sum - maximum) / total;
   } else {
     output.values[index] = activation(sum, p(8u));
   }
@@ -405,14 +461,14 @@ fn conv_delta(@builtin(global_invocation_id) id: vec3<u32>) {
     }
     var total = 0.0;
     for (var item = 0u; item < sample_size; item++) {
-      total += exp(weights.values[batch * sample_size + item] - maximum);
+      total += math_exp(weights.values[batch * sample_size + item] - maximum);
     }
     var dot = 0.0;
     for (var item = 0u; item < sample_size; item++) {
-      let probability = exp(weights.values[batch * sample_size + item] - maximum) / total;
+      let probability = math_exp(weights.values[batch * sample_size + item] - maximum) / total;
       dot += clamp_delta(input.values[batch * sample_size + item]) * probability;
     }
-    let probability = exp(weights.values[index] - maximum) / total;
+    let probability = math_exp(weights.values[index] - maximum) / total;
     gradient = probability * (gradient - dot);
   } else {
     gradient *= activation_derivative(weights.values[index], p(8u));

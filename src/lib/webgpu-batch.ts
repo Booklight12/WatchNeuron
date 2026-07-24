@@ -108,9 +108,10 @@ function alignedSize(byteLength: number) {
   return Math.max(4, Math.ceil(byteLength / 4) * 4);
 }
 
-function parameterBlock(values: number[]) {
+function parameterBlock(values: number[], mathMode = 1) {
   const block = new Uint32Array(16);
   block.set(values.slice(0, 16));
+  block[15] = mathMode === 0 ? 0 : 1;
   return block;
 }
 
@@ -209,8 +210,9 @@ export class WebGpuBatchExecutor {
     descriptors: WebGpuLayerDescriptor[],
     capacity: number,
     sigmoidHead: boolean,
+    mathMode: "fast" | "full",
   ) {
-    return new WebGpuTrainingGraph(this, descriptors, capacity, sigmoidHead);
+    return new WebGpuTrainingGraph(this, descriptors, capacity, sigmoidHead, mathMode);
   }
 
   private createStorage(data: NumericArray, writable: boolean) {
@@ -571,6 +573,7 @@ export class WebGpuTrainingGraph {
     descriptors: WebGpuLayerDescriptor[],
     readonly capacity: number,
     private readonly sigmoidHead: boolean,
+    private readonly mathMode: "fast" | "full",
   ) {
     if (descriptors.length === 0) throw new Error("WebGPU 计算图至少需要一个网络层");
     this.dummy = {};
@@ -640,7 +643,7 @@ export class WebGpuTrainingGraph {
       [finalLayer.output, this.dummy, this.dummy, this.labels],
       [this.probabilities, this.lossDelta, this.losses, this.dummy],
       (batchSize) => batchSize * finalLayer.descriptor.outputSize,
-      (batchSize) => parameterBlock([
+      (batchSize) => this.parameterBlock([
         batchSize,
         finalLayer.descriptor.outputSize,
         this.sigmoidHead ? 1 : 0,
@@ -665,6 +668,10 @@ export class WebGpuTrainingGraph {
       );
     }
     return buffer;
+  }
+
+  private parameterBlock(values: number[]) {
+    return parameterBlock(values, this.mathMode === "fast" ? 0 : 1);
   }
 
   private operation(
@@ -745,7 +752,7 @@ export class WebGpuTrainingGraph {
           [layer.input, layer.weights, layer.biases, this.dummy],
           [layer.output, layer.preactivation, layer.dropoutMask, this.dummy],
           (batchSize) => batchSize * descriptor.outputSize,
-          (batchSize, sampleStep, training) => parameterBlock([
+          (batchSize, sampleStep, training) => this.parameterBlock([
             batchSize,
             descriptor.inputSize,
             descriptor.outputSize,
@@ -766,7 +773,7 @@ export class WebGpuTrainingGraph {
           [layer.input, layer.weights, layer.biases, this.dummy],
           [layer.output, layer.preactivation, this.dummy, this.dummy],
           (batchSize) => batchSize * descriptor.outputSize,
-          (batchSize) => parameterBlock(this.convolutionParams(descriptor, batchSize)),
+          (batchSize) => this.parameterBlock(this.convolutionParams(descriptor, batchSize)),
           (batchSize) => [
             Math.ceil(descriptor.filters / 16),
             Math.ceil(batchSize * outputWidth * outputHeight / 16),
@@ -779,7 +786,7 @@ export class WebGpuTrainingGraph {
           [layer.input, this.dummy, this.dummy, this.dummy],
           [layer.output, this.dummy, layer.indices, this.dummy],
           (batchSize) => batchSize * descriptor.outputSize,
-          (batchSize) => parameterBlock(this.poolingParams(descriptor, batchSize)),
+          (batchSize) => this.parameterBlock(this.poolingParams(descriptor, batchSize)),
         ));
       }
     });
@@ -795,7 +802,7 @@ export class WebGpuTrainingGraph {
             [upstream, layer.preactivation, layer.dropoutMask, this.dummy],
             [layer.delta, this.dummy, this.dummy, this.dummy],
             (batchSize) => batchSize * descriptor.outputSize,
-            (batchSize) => parameterBlock([
+            (batchSize) => this.parameterBlock([
               batchSize,
               descriptor.inputSize,
               descriptor.outputSize,
@@ -807,7 +814,7 @@ export class WebGpuTrainingGraph {
             [layer.delta, layer.weights, this.dummy, this.dummy],
             [layer.inputGradient, this.dummy, this.dummy, this.dummy],
             (batchSize) => batchSize * descriptor.inputSize,
-            (batchSize) => parameterBlock([
+            (batchSize) => this.parameterBlock([
               batchSize,
               descriptor.inputSize,
               descriptor.outputSize,
@@ -818,7 +825,7 @@ export class WebGpuTrainingGraph {
             [layer.input, this.dummy, this.dummy, layer.delta],
             [this.dummy, this.dummy, layer.weightGradient, layer.biasGradient],
             () => Math.max(descriptor.weights.length, descriptor.biases.length),
-            (batchSize) => parameterBlock([
+            (batchSize) => this.parameterBlock([
               batchSize,
               descriptor.inputSize,
               descriptor.outputSize,
@@ -832,14 +839,14 @@ export class WebGpuTrainingGraph {
             [upstream, layer.preactivation, this.dummy, this.dummy],
             [layer.delta, this.dummy, this.dummy, this.dummy],
             (batchSize) => batchSize * descriptor.outputSize,
-            (batchSize) => parameterBlock(this.convolutionParams(descriptor, batchSize)),
+            (batchSize) => this.parameterBlock(this.convolutionParams(descriptor, batchSize)),
           ),
           this.operation(
             "conv_input_gradient",
             [layer.delta, layer.weights, this.dummy, this.dummy],
             [layer.inputGradient, this.dummy, this.dummy, this.dummy],
             (batchSize) => batchSize * descriptor.inputSize,
-            (batchSize) => parameterBlock(this.convolutionParams(descriptor, batchSize)),
+            (batchSize) => this.parameterBlock(this.convolutionParams(descriptor, batchSize)),
           ),
         );
         if (descriptor.trainable) {
@@ -851,7 +858,7 @@ export class WebGpuTrainingGraph {
               [layer.input, this.dummy, this.dummy, layer.delta],
               [this.dummy, this.dummy, layer.weightGradient, this.dummy],
               () => descriptor.weights.length,
-              (batchSize) => parameterBlock(this.convolutionParams(descriptor, batchSize)),
+              (batchSize) => this.parameterBlock(this.convolutionParams(descriptor, batchSize)),
               () => [
                 Math.ceil(reductionSize / 16),
                 Math.ceil(descriptor.filters / 16),
@@ -863,7 +870,7 @@ export class WebGpuTrainingGraph {
               [this.dummy, this.dummy, this.dummy, layer.delta],
               [this.dummy, this.dummy, this.dummy, layer.biasGradient],
               () => descriptor.biases.length,
-              (batchSize) => parameterBlock(this.convolutionParams(descriptor, batchSize)),
+              (batchSize) => this.parameterBlock(this.convolutionParams(descriptor, batchSize)),
             ),
           );
         }
@@ -873,7 +880,7 @@ export class WebGpuTrainingGraph {
           [upstream, this.dummy, this.dummy, layer.indices],
           [layer.inputGradient, layer.delta, this.dummy, this.dummy],
           (batchSize) => batchSize * Math.max(descriptor.inputSize, descriptor.outputSize),
-          (batchSize) => parameterBlock(this.poolingParams(descriptor, batchSize)),
+          (batchSize) => this.parameterBlock(this.poolingParams(descriptor, batchSize)),
         ));
       }
     }
@@ -889,7 +896,7 @@ export class WebGpuTrainingGraph {
         optimizer?: WebGpuOptimizerStep,
       ) => {
         if (!optimizer) throw new Error("WebGPU 优化器参数缺失");
-        return parameterBlock([
+        return this.parameterBlock([
           length,
           optimizer.kind,
           floatBits(optimizer.learningRate),

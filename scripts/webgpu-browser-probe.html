@@ -148,7 +148,7 @@
             biases: new Float32Array(2),
           },
         ];
-        const tiledGraph = executor.createTrainingGraph(tiledDescriptors, 1, false);
+        const tiledGraph = executor.createTrainingGraph(tiledDescriptors, 1, false, "full");
         const tiledForward = await tiledGraph.forward(tiledInput, new Int32Array([0]), 1);
         assertClose(
           Array.from(tiledForward.probabilities),
@@ -197,6 +197,7 @@
           optimizerDescriptors,
           1,
           false,
+          "full",
         );
         const optimizerInput = new Float32Array(784);
         optimizerInput[0] = 1;
@@ -226,6 +227,66 @@
           [0.09, -0.01, 0.09, -0.01],
           1e-5,
         );
+
+        const mathDescriptors = () => {
+          const hiddenWeights = new Float32Array(784 * 2);
+          hiddenWeights[0] = 1;
+          hiddenWeights[784] = -1;
+          return [
+            {
+              type: "dense",
+              inputSize: 784,
+              outputSize: 2,
+              activationKind: 10,
+              dropoutRate: 0,
+              weights: hiddenWeights,
+              biases: new Float32Array(2),
+            },
+            {
+              type: "dense",
+              inputSize: 2,
+              outputSize: 2,
+              activationKind: 0,
+              dropoutRate: 0,
+              weights: new Float32Array([1, 0, 0, 1]),
+              biases: new Float32Array(2),
+            },
+          ];
+        };
+        const mathInput = new Float32Array(784);
+        mathInput[0] = 2;
+        const fastMathGraph = executor.createTrainingGraph(
+          mathDescriptors(),
+          1,
+          false,
+          "fast",
+        );
+        const fullMathGraph = executor.createTrainingGraph(
+          mathDescriptors(),
+          1,
+          false,
+          "full",
+        );
+        const [fastMath, fullMath] = await Promise.all([
+          fastMathGraph.forward(mathInput, new Int32Array([0]), 1),
+          fullMathGraph.forward(mathInput, new Int32Array([0]), 1),
+        ]);
+        const fastProbabilityTotal = fastMath.probabilities[0] + fastMath.probabilities[1];
+        if (
+          ![...fastMath.probabilities, ...fastMath.losses].every(Number.isFinite) ||
+          ![...fullMath.probabilities, ...fullMath.losses].every(Number.isFinite) ||
+          Math.abs(fastProbabilityTotal - 1) > 1e-4
+        ) {
+          throw new Error("WebGPU fast/full math produced invalid values");
+        }
+        if (
+          Math.max(
+            ...fastMath.probabilities.map((value, index) =>
+              Math.abs(value - fullMath.probabilities[index])),
+          ) < 1e-6
+        ) {
+          throw new Error("WebGPU fast/full math paths did not diverge");
+        }
         const workerResult = await runTraining({
           mnistEnabled: false,
           layers: [{ id: "gpu-hidden", units: 4, activation: "relu", dropout: 0 }],
@@ -236,7 +297,7 @@
             epochs: 1,
             learningRate: 0.003,
             batchSize: 2,
-            mathMode: "full",
+            mathMode: "fast",
             computeBackend: "webgpu",
             optimizer,
           },
@@ -355,6 +416,9 @@
         if (!workerResult.finite || !webgpuBenchmark.finite || !wasmBenchmark.finite) {
           throw new Error("training produced a non-finite parameter");
         }
+        if (!workerResult.backend.includes("快速")) {
+          throw new Error(`WebGPU worker ignored fast math mode: ${workerResult.backend}`);
+        }
         if (benchmark.speedup <= 1) {
           throw new Error(
             `WebGPU multi-convolution benchmark did not beat SIMD (${benchmark.speedup.toFixed(2)}x; ` +
@@ -373,6 +437,12 @@
           poolingBackward: Array.from(poolingBackward.inputGradient),
           probabilities: Array.from(loss.output),
           losses: Array.from(loss.losses),
+          mathModes: {
+            fastProbabilities: Array.from(fastMath.probabilities),
+            fullProbabilities: Array.from(fullMath.probabilities),
+            fastLoss: fastMath.losses[0],
+            fullLoss: fullMath.losses[0],
+          },
           worker: workerResult,
           benchmark,
         });

@@ -1931,10 +1931,7 @@ async function train(message: TrainMessage) {
   const batchSize = Number.isFinite(message.settings.batchSize)
     ? Math.max(1, Math.floor(message.settings.batchSize))
     : 16;
-  const mathMode: MathMode =
-    requestedComputeBackend === "webgpu" || message.settings.mathMode === "full"
-      ? "full"
-      : "fast";
+  const mathMode: MathMode = message.settings.mathMode === "full" ? "full" : "fast";
   const runtime = createWasmTrainingRuntime(
     loadedWasm.exports,
     sourceModel,
@@ -1952,6 +1949,7 @@ async function train(message: TrainMessage) {
       runtime.webgpuDescriptors,
       runtime.batch.capacity,
       runtime.outputHead === "sigmoid",
+      runtime.mathMode,
     );
     postMessage({
       type: "progress",

@@ -148,7 +148,7 @@ function storedTrainingProfiles(): TrainingProfiles {
     if (!parsed || typeof parsed !== "object") return fallback;
     const isProfileFormat = parsed.scratch && parsed.finetune;
     return {
-      mathMode: parsed.computeBackend === "webgpu" || parsed.mathMode === "full" ? "full" : "fast",
+      mathMode: parsed.mathMode === "full" ? "full" : "fast",
       computeBackend: parsed.computeBackend === "webgpu" ? "webgpu" : "wasm",
       scratch: normalizeTrainingProfile(
         isProfileFormat ? parsed.scratch : parsed,
@@ -855,7 +855,7 @@ function updateTrainingSettings(mode: TrainingMode, settings: TrainingSettings) 
   const fallback = mode === "finetune" ? defaultFinetuneProfile() : defaultScratchProfile();
   trainingProfiles.value = {
     ...trainingProfiles.value,
-    mathMode: settings.computeBackend === "webgpu" || settings.mathMode === "full" ? "full" : "fast",
+    mathMode: settings.mathMode === "full" ? "full" : "fast",
     computeBackend: settings.computeBackend === "webgpu" ? "webgpu" : "wasm",
     [mode]: normalizeTrainingProfile(settings, fallback),
   };
