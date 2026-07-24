@@ -15,6 +15,7 @@ const props = defineProps<{
   config: ConvolutionConfig;
   input: FeatureMapShape;
   displayIndex: number;
+  removable: boolean;
 }>();
 const emit = defineEmits<{
   update: [config: ConvolutionConfig];
@@ -105,7 +106,7 @@ function clearKernel() {
         <b>二维卷积层</b>
         <small>Conv2D · {{ input.width }} × {{ input.height }} × {{ input.channels }}</small>
       </div>
-      <button class="delete-layer" type="button" title="删除卷积层" aria-label="删除卷积层" @click="emit('remove')">
+      <button class="delete-layer" type="button" title="删除卷积层" aria-label="删除卷积层" :disabled="!removable" @click="emit('remove')">
         <Trash2 :size="15" />
       </button>
     </div>

@@ -19,7 +19,7 @@ const candidates: Array<{ file: string; flavor: WasmKernelFlavor }> = [
 
 // Public Wasm files keep stable names, so bump this value whenever the kernel
 // changes to prevent browsers and CDNs from reusing an older implementation.
-const kernelVersion = "20260724-bce-f32-1";
+const kernelVersion = "20260724-batch-wasm-2";
 
 export function applyWasmMathMode(
   exports: MathModeWasmExports,

@@ -165,7 +165,12 @@ function storedTrainingProfiles(): TrainingProfiles {
 function storedLayers() {
   try {
     const parsed = JSON.parse(localStorage.getItem("watchneuron-architecture") ?? "null");
-    if (!Array.isArray(parsed) || parsed.length < 1) return defaultLayers();
+    if (!Array.isArray(parsed)) return defaultLayers();
+    if (parsed.length === 0) {
+      return storedConvolutions().length > 0 || storedPoolings().length > 0
+        ? []
+        : defaultLayers();
+    }
     return parsed.map((layer, index) => {
       const units = Number(layer.units);
       return {

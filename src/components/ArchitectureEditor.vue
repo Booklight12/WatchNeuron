@@ -127,6 +127,7 @@ const orderedLayers = computed(() => {
   }
   return result;
 });
+const canRemoveLayer = computed(() => orderedLayers.value.length > 1);
 
 const dragTargetIndex = computed(() => {
   if (!draggedLayerKey.value) return -1;
@@ -336,6 +337,7 @@ function updateConvolution(config: ConvolutionConfig) {
 }
 
 function removeConvolution(id: string) {
+  if (!canRemoveLayer.value) return;
   emit("updateConvolutions", props.convolutions.filter((config) => config.id !== id));
 }
 
@@ -347,11 +349,12 @@ function updatePooling(config: PoolingConfig) {
 }
 
 function removePooling(id: string) {
+  if (!canRemoveLayer.value) return;
   emit("updatePoolings", props.poolings.filter((config) => config.id !== id));
 }
 
 function removeLayer(id: string) {
-  if (props.layers.length <= 1) return;
+  if (!canRemoveLayer.value) return;
   emit("update", props.layers.filter((layer) => layer.id !== id));
 }
 
@@ -576,6 +579,7 @@ function handlePointerCancel() {
           :config="item.config"
           :input="item.input"
           :display-index="item.displayIndex"
+          :removable="canRemoveLayer"
           @update="updateConvolution"
           @remove="removeConvolution(item.config.id)"
         >
@@ -600,6 +604,7 @@ function handlePointerCancel() {
           :config="item.config"
           :input="item.input"
           :display-index="item.displayIndex"
+          :removable="canRemoveLayer"
           @update="updatePooling"
           @remove="removePooling(item.config.id)"
         >
@@ -648,7 +653,7 @@ function handlePointerCancel() {
               />
               <button type="button" title="增加神经元" aria-label="增加神经元" @click="step(item.layer.id, 8)"><Plus :size="14" /></button>
             </div>
-            <button class="delete-layer" type="button" title="删除层" aria-label="删除层" :disabled="layers.length <= 1" @click="removeLayer(item.layer.id)"><Trash2 :size="15" /></button>
+            <button class="delete-layer" type="button" title="删除层" aria-label="删除层" :disabled="!canRemoveLayer" @click="removeLayer(item.layer.id)"><Trash2 :size="15" /></button>
           </div>
           <label class="activation-select">
             <span>激活</span>

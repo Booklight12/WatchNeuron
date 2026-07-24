@@ -13,6 +13,7 @@ const props = defineProps<{
   config: PoolingConfig;
   input: FeatureMapShape;
   displayIndex: number;
+  removable: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -59,7 +60,7 @@ function setInteger(key: "stride" | "padding", input: HTMLInputElement) {
         <b>{{ config.kind === 'globalAverage' ? '全局平均池化' : config.kind === 'max' ? '最大池化层' : '平均池化层' }}</b>
         <small>{{ config.kind === 'globalAverage' ? 'GAP' : config.kind === 'max' ? 'MaxPool2D' : 'AvgPool2D' }} · {{ input.width }} × {{ input.height }} × {{ input.channels }}</small>
       </div>
-      <button class="delete-layer" type="button" title="删除池化层" aria-label="删除池化层" @click="emit('remove')">
+      <button class="delete-layer" type="button" title="删除池化层" aria-label="删除池化层" :disabled="!removable" @click="emit('remove')">
         <Trash2 :size="15" />
       </button>
     </div>
