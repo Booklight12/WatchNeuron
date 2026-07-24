@@ -6,7 +6,7 @@ const cacheRoot = resolve(".zig-cache");
 mkdirSync(resolve(cacheRoot, "global"), { recursive: true });
 mkdirSync(resolve(cacheRoot, "local"), { recursive: true });
 
-const args = [
+const commonArgs = [
   "build-exe",
   "wasm/neuron_kernel.zig",
   "-target",
@@ -18,21 +18,37 @@ const args = [
   "--export=matvec",
   "--export=activate",
   "--export=forward_sparse",
+  "--export=forward_dense_block",
+  "--export=forward_dense_training",
   "--export=train_sample",
+  "--export=train_dense_from_gradient",
+  "--export=conv2d_forward",
+  "--export=conv2d_train",
+  "--export=simd_enabled",
+  "--export=set_math_mode",
+  "--export=math_mode",
   "--export=__heap_base",
   "--initial-memory=8388608",
-  "-femit-bin=public/neuron_kernel.wasm",
 ];
 
-const result = spawnSync("zig", args, {
-  stdio: "inherit",
-  shell: process.platform === "win32",
-  env: {
-    ...process.env,
-    ZIG_GLOBAL_CACHE_DIR: resolve(cacheRoot, "global"),
-    ZIG_LOCAL_CACHE_DIR: resolve(cacheRoot, "local"),
-  },
-});
+function buildKernel(cpu, output) {
+  const result = spawnSync("zig", [
+    ...commonArgs,
+    `-mcpu=${cpu}`,
+    `-femit-bin=${output}`,
+  ], {
+    stdio: "inherit",
+    shell: false,
+    env: {
+      ...process.env,
+      ZIG_GLOBAL_CACHE_DIR: resolve(cacheRoot, "global"),
+      ZIG_LOCAL_CACHE_DIR: resolve(cacheRoot, "local"),
+    },
+  });
 
-if (result.error) throw result.error;
-process.exit(result.status ?? 1);
+  if (result.error) throw result.error;
+  if (result.status !== 0) process.exit(result.status ?? 1);
+}
+
+buildKernel("baseline", "public/neuron_kernel.wasm");
+buildKernel("baseline+simd128", "public/neuron_kernel_simd.wasm");

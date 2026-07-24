@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, watch } from "vue";
-import { Activity, BrainCircuit, Cpu, Database, Layers3, Pause, Play, SlidersHorizontal, Zap } from "@lucide/vue";
+import { Activity, BrainCircuit, Cpu, Database, Layers3, Pause, Play, ScanLine, SlidersHorizontal, Zap } from "@lucide/vue";
 import ArchitectureEditor from "./components/ArchitectureEditor.vue";
 import DatasetManager from "./components/DatasetManager.vue";
 import DigitCanvas from "./components/DigitCanvas.vue";
@@ -10,17 +10,28 @@ import OptimizerManager from "./components/OptimizerManager.vue";
 import PixelPreview from "./components/PixelPreview.vue";
 import PredictionPanel from "./components/PredictionPanel.vue";
 import PropagationStepper from "./components/PropagationStepper.vue";
+import SignalFlowExplorer from "./components/SignalFlowExplorer.vue";
 import TrainingPanel from "./components/TrainingPanel.vue";
 import { InferenceEngine } from "./lib/engine";
 import { activationLabels, buildModel, countParameters, isActivationKind } from "./lib/model";
 import {
-  deleteModelRecord,
+  architectureLayerSizes,
+  convolutionPipeline,
+  createDefaultConvolutionConfig,
+  fitConvolutionsToLayers,
+  modelConvolutions,
+  normalizeConvolutionConfig,
+} from "./lib/convolution";
+import {
+  deleteModelRecords,
   listSavedModels,
   renameModelRecord,
   saveModelRecord,
 } from "./lib/modelLibrary";
 import type {
   CustomDatasetSample,
+  ConvolutionConfig,
+  ConvolutionLayerData,
   DatasetSplit,
   HiddenLayer,
   InferenceResult,
@@ -32,12 +43,14 @@ import type {
   SerializedModel,
   TrainingProgress,
   TrainingMode,
+  TrainingProfileSettings,
+  TrainingProfiles,
   TrainingSettings,
   TrainingTrace,
 } from "./types";
 
 const defaultLayers = (): HiddenLayer[] => [
-  { id: "layer-1", units: 32, activation: "relu" },
+  { id: "layer-1", units: 32, activation: "relu", dropout: 0 },
 ];
 
 const defaultOptimizer = (): OptimizerConfig => ({
@@ -49,50 +62,84 @@ const defaultOptimizer = (): OptimizerConfig => ({
   epsilon: 1e-8,
 });
 
-function storedTrainingSettings(): TrainingSettings {
-  const fallback: TrainingSettings = {
-    epochs: 10,
-    learningRate: 0.018,
-    optimizer: defaultOptimizer(),
+const defaultScratchProfile = (): TrainingProfileSettings => ({
+  epochs: 10,
+  learningRate: 0.018,
+  optimizer: defaultOptimizer(),
+});
+
+const defaultFinetuneProfile = (): TrainingProfileSettings => ({
+  epochs: 5,
+  learningRate: 0.0002,
+  optimizer: { ...defaultOptimizer(), kind: "adam" },
+});
+
+function normalizeTrainingProfile(
+  value: unknown,
+  fallback: TrainingProfileSettings,
+): TrainingProfileSettings {
+  const source = value && typeof value === "object"
+    ? value as Partial<TrainingProfileSettings>
+    : {};
+  const optimizer = source.optimizer && typeof source.optimizer === "object"
+    ? source.optimizer
+    : {} as Partial<OptimizerConfig>;
+  const epochs = Number(source.epochs);
+  const learningRate = Number(source.learningRate);
+  const kind = ["sgd", "momentum", "adam", "rmsprop", "adagrad"].includes(String(optimizer.kind))
+    ? optimizer.kind as OptimizerConfig["kind"]
+    : fallback.optimizer.kind;
+  return {
+    epochs: Number.isFinite(epochs) ? Math.max(1, Math.floor(epochs)) : fallback.epochs,
+    learningRate: Number.isFinite(learningRate) && learningRate > 0
+      ? learningRate
+      : fallback.learningRate,
+    optimizer: {
+      kind,
+      momentum:
+        Number.isFinite(optimizer.momentum) && optimizer.momentum! >= 0 && optimizer.momentum! < 1
+          ? optimizer.momentum!
+          : fallback.optimizer.momentum,
+      beta1:
+        Number.isFinite(optimizer.beta1) && optimizer.beta1! > 0 && optimizer.beta1! < 1
+          ? optimizer.beta1!
+          : fallback.optimizer.beta1,
+      beta2:
+        Number.isFinite(optimizer.beta2) && optimizer.beta2! > 0 && optimizer.beta2! < 1
+          ? optimizer.beta2!
+          : fallback.optimizer.beta2,
+      decay:
+        Number.isFinite(optimizer.decay) && optimizer.decay! > 0 && optimizer.decay! < 1
+          ? optimizer.decay!
+          : fallback.optimizer.decay,
+      epsilon:
+        Number.isFinite(optimizer.epsilon) && optimizer.epsilon! > 0
+          ? optimizer.epsilon!
+          : fallback.optimizer.epsilon,
+    },
+  };
+}
+
+function storedTrainingProfiles(): TrainingProfiles {
+  const fallback: TrainingProfiles = {
+    mathMode: "fast",
+    scratch: defaultScratchProfile(),
+    finetune: defaultFinetuneProfile(),
   };
   try {
     const parsed = JSON.parse(localStorage.getItem("watchneuron-training-settings") ?? "null");
     if (!parsed || typeof parsed !== "object") return fallback;
-    const epochs = Number(parsed.epochs);
-    const learningRate = Number(parsed.learningRate);
-    const optimizer = parsed.optimizer ?? {};
-    const kind = ["sgd", "momentum", "adam", "rmsprop", "adagrad"].includes(optimizer.kind)
-      ? optimizer.kind
-      : "sgd";
+    const isProfileFormat = parsed.scratch && parsed.finetune;
     return {
-      epochs: Number.isFinite(epochs) ? Math.max(1, Math.floor(epochs)) : fallback.epochs,
-      learningRate:
-        Number.isFinite(learningRate) && learningRate > 0
-          ? learningRate
-          : fallback.learningRate,
-      optimizer: {
-        kind,
-        momentum:
-          Number.isFinite(optimizer.momentum) && optimizer.momentum >= 0 && optimizer.momentum < 1
-            ? optimizer.momentum
-            : fallback.optimizer.momentum,
-        beta1:
-          Number.isFinite(optimizer.beta1) && optimizer.beta1 > 0 && optimizer.beta1 < 1
-            ? optimizer.beta1
-            : fallback.optimizer.beta1,
-        beta2:
-          Number.isFinite(optimizer.beta2) && optimizer.beta2 > 0 && optimizer.beta2 < 1
-            ? optimizer.beta2
-            : fallback.optimizer.beta2,
-        decay:
-          Number.isFinite(optimizer.decay) && optimizer.decay > 0 && optimizer.decay < 1
-            ? optimizer.decay
-            : fallback.optimizer.decay,
-        epsilon:
-          Number.isFinite(optimizer.epsilon) && optimizer.epsilon > 0
-            ? optimizer.epsilon
-            : fallback.optimizer.epsilon,
-      },
+      mathMode: parsed.mathMode === "full" ? "full" : "fast",
+      scratch: normalizeTrainingProfile(
+        isProfileFormat ? parsed.scratch : parsed,
+        fallback.scratch,
+      ),
+      finetune: normalizeTrainingProfile(
+        isProfileFormat ? parsed.finetune : null,
+        fallback.finetune,
+      ),
     };
   } catch {
     return fallback;
@@ -102,18 +149,84 @@ function storedTrainingSettings(): TrainingSettings {
 function storedLayers() {
   try {
     const parsed = JSON.parse(localStorage.getItem("watchneuron-architecture") ?? "null");
-    if (!Array.isArray(parsed) || parsed.length < 1 || parsed.length > 4) return defaultLayers();
+    if (!Array.isArray(parsed) || parsed.length < 1) return defaultLayers();
     return parsed.map((layer, index) => {
       const units = Number(layer.units);
       return {
         id: String(layer.id ?? `layer-${index + 1}`),
-        units: Number.isFinite(units) ? Math.max(8, Math.floor(units)) : 32,
+        units: Number.isFinite(units) ? Math.max(1, Math.floor(units)) : 32,
         activation: isActivationKind(layer.activation) ? layer.activation : "relu",
+        dropout: Number.isFinite(Number(layer.dropout))
+          ? Math.min(0.95, Math.max(0, Number(layer.dropout)))
+          : 0,
       };
     }) as HiddenLayer[];
   } catch {
     return defaultLayers();
   }
+}
+
+function storedConvolutions() {
+  try {
+    const stored = JSON.parse(localStorage.getItem("watchneuron-convolutions") ?? "null");
+    if (Array.isArray(stored)) return stored.map(normalizeConvolutionConfig);
+    const legacy = normalizeConvolutionConfig(
+      JSON.parse(localStorage.getItem("watchneuron-convolution") ?? "null"),
+    );
+    return legacy.enabled ? [legacy] : [];
+  } catch {
+    return [];
+  }
+}
+
+function convolutionConfigFromLayer(layer: ConvolutionLayerData | null | undefined) {
+  if (!layer) return createDefaultConvolutionConfig();
+  const kernelLength = layer.kernelSize * layer.kernelSize;
+  return normalizeConvolutionConfig({
+    id: layer.id,
+    enabled: true,
+    position: Number.isFinite(layer.position) ? layer.position : 0,
+    filters: layer.filters,
+    kernelSize: layer.kernelSize,
+    stride: layer.stride,
+    padding: layer.padding,
+    activation: layer.activation,
+    kernels: Array.from({ length: layer.filters }, (_, filter) =>
+      Array.from(layer.weights.slice(
+        filter * layer.inputChannels * kernelLength,
+        filter * layer.inputChannels * kernelLength + kernelLength,
+      )),
+    ),
+  });
+}
+
+function convolutionConfigsFromRecord(record: SavedModel) {
+  const configs = Array.isArray(record.convolutionConfigs)
+    ? record.convolutionConfigs.map(normalizeConvolutionConfig)
+    : record.convolutionConfig
+      ? [normalizeConvolutionConfig(record.convolutionConfig)]
+      : modelConvolutions(record.model).map(convolutionConfigFromLayer);
+  return fitConvolutionsToLayers(configs, record.hiddenLayers);
+}
+
+function normalizeSavedModelRecord(record: SavedModel): SavedModel {
+  const convolutionConfigs = convolutionConfigsFromRecord(record);
+  const convolutions = modelConvolutions(record.model).map((convolution, index) => ({
+    ...convolution,
+    id: convolution.id || convolutionConfigs[index]?.id || `conv-model-${index}`,
+  }));
+  return {
+    ...record,
+    hiddenLayers: record.hiddenLayers.map((layer) => ({
+      ...layer,
+      dropout: Number.isFinite(layer.dropout) ? Math.min(0.95, Math.max(0, layer.dropout)) : 0,
+    })),
+    convolutionConfigs,
+    model: {
+      ...record.model,
+      convolutions,
+    },
+  };
 }
 
 function storedCustomSamples(): CustomDatasetSample[] {
@@ -153,10 +266,11 @@ function storedMnistEnabled() {
 }
 
 const engine = new InferenceEngine();
-type AppView = "lab" | "samples" | "models" | "optimizer";
+type AppView = "lab" | "signals" | "samples" | "models" | "optimizer";
 type ModelSaveState = "idle" | "saving" | "saved" | "error";
 
 function viewFromHash(): AppView {
+  if (window.location.hash === "#signals") return "signals";
   if (window.location.hash === "#samples") return "samples";
   if (window.location.hash === "#models") return "models";
   if (window.location.hash === "#optimizer") return "optimizer";
@@ -168,27 +282,33 @@ const digitCanvas = ref<InstanceType<typeof DigitCanvas> | null>(null);
 const serialized = shallowRef<SerializedModel | null>(null);
 const trainedModel = shallowRef<NeuralModel | null>(null);
 const trainedEpochCount = ref(0);
-const hiddenLayers = ref<HiddenLayer[]>(storedLayers());
+const initialHiddenLayers = storedLayers();
+const hiddenLayers = ref<HiddenLayer[]>(initialHiddenLayers);
+const convolutions = ref<ConvolutionConfig[]>(
+  fitConvolutionsToLayers(storedConvolutions(), initialHiddenLayers),
+);
 const customSamples = ref<CustomDatasetSample[]>(storedCustomSamples());
 const mnistEnabled = ref(storedMnistEnabled());
 const savedModels = ref<SavedModel[]>([]);
 const modelLibraryLoading = ref(true);
+const modelLibraryDeleting = ref(false);
 const modelSaveState = ref<ModelSaveState>("idle");
 const activeTrainingMode = ref<TrainingMode>("scratch");
+const optimizerViewMode = ref<TrainingMode>("scratch");
 const inputPixels = shallowRef<Float32Array>(new Float32Array(784));
 const inputEnergy = ref(0);
-const engineBackend = ref<"Wasm" | "JavaScript">("JavaScript");
+const engineBackend = ref<"Wasm SIMD" | "Wasm" | "JavaScript">("JavaScript");
 const loading = ref(true);
 const animated = ref(true);
 const selectedLayer = ref(1);
 const stepMode = ref(false);
 const stepDirection = ref<PropagationDirection>("forward");
 const sampleCursor = ref(8);
-const trainingSettings = ref<TrainingSettings>(storedTrainingSettings());
+const trainingProfiles = ref<TrainingProfiles>(storedTrainingProfiles());
 const trainingProgress = ref<TrainingProgress>({
   phase: "idle",
   epoch: 0,
-  epochs: 10,
+  epochs: trainingProfiles.value.scratch.epochs,
   accuracy: 0,
   loss: 0,
   elapsedMs: 0,
@@ -204,7 +324,7 @@ const inference = shallowRef<InferenceResult>({
 });
 
 const generatedModel = computed(() =>
-  serialized.value ? buildModel(serialized.value, hiddenLayers.value) : null,
+  serialized.value ? buildModel(serialized.value, hiddenLayers.value, convolutions.value) : null,
 );
 const model = computed(() => trainedModel.value ?? generatedModel.value);
 const modelStatus = computed(() => {
@@ -221,14 +341,22 @@ const customTestCount = computed(
 const datasetLocked = computed(
   () => ["loading", "training", "paused"].includes(trainingProgress.value.phase),
 );
-const layerSizes = computed(() => [784, ...hiddenLayers.value.map((layer) => layer.units), 10]);
-const layerNames = computed(() => [
-  "输入层",
-  ...hiddenLayers.value.map(
-    (layer, index) => `隐藏层 ${index + 1} · ${activationLabels[layer.activation]}`,
-  ),
-  "输出层 · Softmax",
-]);
+const convolutionEntries = computed(() => convolutionPipeline(hiddenLayers.value, convolutions.value));
+const layerSizes = computed(() => architectureLayerSizes(hiddenLayers.value, convolutions.value));
+const layerNames = computed(() => {
+  const names = ["输入层"];
+  for (let position = 0; position <= hiddenLayers.value.length; position++) {
+    for (const { config } of convolutionEntries.value.filter((entry) => entry.config.position === position)) {
+      names.push(`卷积层 · ${config.filters} 核 · ${activationLabels[config.activation]}`);
+    }
+    if (position < hiddenLayers.value.length) {
+      const layer = hiddenLayers.value[position];
+      names.push(`隐藏层 ${position + 1} · ${activationLabels[layer.activation]}`);
+    }
+  }
+  names.push("输出层 · Softmax");
+  return names;
+});
 const trainingFlowActive = computed(
   () =>
     trainingTrace.value !== null &&
@@ -281,10 +409,7 @@ const selectedStats = computed(() => {
   };
 });
 const selectedLayerName = computed(() => {
-  if (selectedLayer.value === 0) return "输入层";
-  if (selectedLayer.value === layerSizes.value.length - 1) return "输出层";
-  const layer = hiddenLayers.value[selectedLayer.value - 1];
-  return `隐藏层 ${selectedLayer.value} · ${activationLabels[layer.activation]}`;
+  return layerNames.value[selectedLayer.value] ?? "网络层";
 });
 
 function formatSignal(value: number) {
@@ -298,7 +423,7 @@ function runInference() {
   if (inputEnergy.value < 0.001) {
     inference.value = {
       probabilities: Array.from({ length: 10 }, () => 0),
-      activations: [Array.from(inputPixels.value), ...model.value.layers.map((layer) => Array.from({ length: layer.outputSize }, () => 0))],
+      activations: layerSizes.value.map((size) => Array.from({ length: size }, () => 0)),
       latencyMs: 0,
       backend: engine.backend,
     };
@@ -383,6 +508,11 @@ function cloneNeuralModel(model: NeuralModel): NeuralModel {
   return {
     calibrated: model.calibrated,
     trained: model.trained,
+    convolutions: modelConvolutions(model).map((convolution) => ({
+      ...convolution,
+      weights: Float32Array.from(convolution.weights),
+      biases: Float32Array.from(convolution.biases),
+    })),
     layers: model.layers.map((layer) => ({
       ...layer,
       weights: Float32Array.from(layer.weights),
@@ -424,6 +554,10 @@ async function persistTrainingModel(
     source,
     trainingMode,
     hiddenLayers: hiddenLayers.value.map((layer) => ({ ...layer })),
+    convolutionConfigs: convolutions.value.map((convolution) => ({
+      ...convolution,
+      kernels: convolution.kernels.map((kernel) => [...kernel]),
+    })),
     model,
     progress: { ...progress },
   };
@@ -447,12 +581,20 @@ async function renameSavedModel(id: string, name: string) {
   }
 }
 
-async function removeSavedModel(id: string) {
+async function removeSavedModels(ids: string[]) {
+  const availableIds = new Set(savedModels.value.map((model) => model.id));
+  const targetIds = [...new Set(ids)].filter((id) => availableIds.has(id));
+  if (modelLibraryDeleting.value || !targetIds.length) return;
+
+  modelLibraryDeleting.value = true;
   try {
-    await deleteModelRecord(id);
-    savedModels.value = savedModels.value.filter((model) => model.id !== id);
+    await deleteModelRecords(targetIds);
+    const removedIds = new Set(targetIds);
+    savedModels.value = savedModels.value.filter((model) => !removedIds.has(model.id));
   } catch {
-    // Keep the model visible if IndexedDB rejects the deletion.
+    // Keep every model visible when the atomic IndexedDB transaction fails.
+  } finally {
+    modelLibraryDeleting.value = false;
   }
 }
 
@@ -461,27 +603,34 @@ async function loadSavedModel(record: SavedModel) {
   trainingTrace.value = null;
   modelSaveOperation++;
   modelSaveState.value = "idle";
-  hiddenLayers.value = record.hiddenLayers.map((layer) => ({ ...layer }));
+  hiddenLayers.value = record.hiddenLayers.map((layer) => ({
+    ...layer,
+    dropout: Number.isFinite(layer.dropout) ? Math.min(0.95, Math.max(0, layer.dropout)) : 0,
+  }));
+  convolutions.value = convolutionConfigsFromRecord(record);
   await nextTick();
   trainedModel.value = cloneNeuralModel(record.model);
   trainedEpochCount.value = Math.max(0, Math.floor(record.progress.epoch));
+  activeTrainingMode.value = "finetune";
   trainingProgress.value = {
     phase: "idle",
     epoch: 0,
-    epochs: trainingSettings.value.epochs,
+    epochs: trainingProfiles.value.finetune.epochs,
     accuracy: 0,
     loss: 0,
     elapsedMs: 0,
   };
-  selectedLayer.value = Math.min(selectedLayer.value, record.hiddenLayers.length + 1);
+  selectedLayer.value = Math.min(selectedLayer.value, layerSizes.value.length - 1);
   navigateTo("lab");
   runInference();
 }
 
 function navigateTo(view: AppView) {
   activeView.value = view;
-  const hash = view === "samples"
-    ? "#samples"
+  const hash = view === "signals"
+    ? "#signals"
+    : view === "samples"
+      ? "#samples"
     : view === "models"
       ? "#models"
       : view === "optimizer"
@@ -495,49 +644,45 @@ function syncViewFromHash() {
   activeView.value = viewFromHash();
 }
 
-function updateLayers(layers: HiddenLayer[]) {
-  hiddenLayers.value = layers;
+function openOptimizer(mode: TrainingMode = "scratch") {
+  optimizerViewMode.value = mode;
+  navigateTo("optimizer");
 }
 
-function updateTrainingSettings(settings: TrainingSettings) {
-  const optimizer = settings.optimizer ?? defaultOptimizer();
-  trainingSettings.value = {
-    ...settings,
-    epochs: Number.isFinite(settings.epochs)
-      ? Math.max(1, Math.floor(settings.epochs))
-      : 1,
-    learningRate:
-      Number.isFinite(settings.learningRate) && settings.learningRate > 0
-        ? settings.learningRate
-        : trainingSettings.value.learningRate,
-    optimizer: {
-      kind: ["sgd", "momentum", "adam", "rmsprop", "adagrad"].includes(optimizer.kind)
-        ? optimizer.kind
-        : "sgd",
-      momentum:
-        Number.isFinite(optimizer.momentum) && optimizer.momentum >= 0 && optimizer.momentum < 1
-          ? optimizer.momentum
-          : 0.9,
-      beta1:
-        Number.isFinite(optimizer.beta1) && optimizer.beta1 > 0 && optimizer.beta1 < 1
-          ? optimizer.beta1
-          : 0.9,
-      beta2:
-        Number.isFinite(optimizer.beta2) && optimizer.beta2 > 0 && optimizer.beta2 < 1
-          ? optimizer.beta2
-          : 0.999,
-      decay:
-        Number.isFinite(optimizer.decay) && optimizer.decay > 0 && optimizer.decay < 1
-          ? optimizer.decay
-          : 0.9,
-      epsilon:
-        Number.isFinite(optimizer.epsilon) && optimizer.epsilon > 0
-          ? optimizer.epsilon
-          : 1e-8,
-    },
+function updateLayers(layers: HiddenLayer[]) {
+  const removedIndex = hiddenLayers.value.findIndex(
+    (layer) => !layers.some((candidate) => candidate.id === layer.id),
+  );
+  hiddenLayers.value = layers;
+  const shifted = removedIndex < 0
+    ? convolutions.value
+    : convolutions.value.map((convolution) => ({
+        ...convolution,
+        position: convolution.position > removedIndex
+          ? convolution.position - 1
+          : convolution.position,
+      }));
+  convolutions.value = fitConvolutionsToLayers(shifted, layers);
+}
+
+function updateConvolutions(configs: ConvolutionConfig[]) {
+  convolutions.value = fitConvolutionsToLayers(configs, hiddenLayers.value);
+}
+
+function reorderArchitecture(layers: HiddenLayer[], configs: ConvolutionConfig[]) {
+  hiddenLayers.value = layers;
+  convolutions.value = fitConvolutionsToLayers(configs, layers);
+}
+
+function updateTrainingSettings(mode: TrainingMode, settings: TrainingSettings) {
+  const fallback = mode === "finetune" ? defaultFinetuneProfile() : defaultScratchProfile();
+  trainingProfiles.value = {
+    ...trainingProfiles.value,
+    mathMode: settings.mathMode === "full" ? "full" : "fast",
+    [mode]: normalizeTrainingProfile(settings, fallback),
   };
   if (trainingProgress.value.phase === "idle") {
-    trainingProgress.value.epochs = trainingSettings.value.epochs;
+    trainingProgress.value.epochs = trainingProfiles.value[mode].epochs;
   }
 }
 
@@ -552,7 +697,12 @@ function startTraining(mode: TrainingMode = "scratch") {
     return;
   }
   const baseEpochs = mode === "finetune" ? trainedEpochCount.value : 0;
-  const initialModel = mode === "finetune" ? trainedModel.value!.layers : undefined;
+  const initialModel = mode === "finetune" ? cloneNeuralModel(trainedModel.value!) : undefined;
+  const settings: TrainingSettings = {
+    ...trainingProfiles.value[mode],
+    mathMode: trainingProfiles.value.mathMode,
+    optimizer: { ...trainingProfiles.value[mode].optimizer },
+  };
   trainingWorker?.terminate();
   trainingTrace.value = null;
   activeTrainingMode.value = mode;
@@ -561,7 +711,7 @@ function startTraining(mode: TrainingMode = "scratch") {
   trainingProgress.value = {
     phase: "loading",
     epoch: 0,
-    epochs: trainingSettings.value.epochs,
+    epochs: settings.epochs,
     accuracy: 0,
     loss: 0,
     elapsedMs: 0,
@@ -594,7 +744,7 @@ function startTraining(mode: TrainingMode = "scratch") {
       trainingProgress.value = {
         ...trainingProgress.value,
         ...message,
-        epochs: message.epochs ?? trainingSettings.value.epochs,
+        epochs: message.epochs ?? settings.epochs,
       };
       return;
     }
@@ -609,11 +759,7 @@ function startTraining(mode: TrainingMode = "scratch") {
       return;
     }
     if (message.type === "snapshot") {
-      const snapshotModel: NeuralModel = {
-        layers: message.model,
-        calibrated: false,
-        trained: true,
-      };
+      const snapshotModel = cloneNeuralModel(message.model as NeuralModel);
       void persistTrainingModel(snapshotModel, "paused", {
         epoch: baseEpochs + message.epoch,
         epochs: baseEpochs + message.epochs,
@@ -625,19 +771,15 @@ function startTraining(mode: TrainingMode = "scratch") {
     }
     if (message.type === "complete") {
       trainingTrace.value = null;
-      const completedModel: NeuralModel = {
-        layers: message.model,
-        calibrated: false,
-        trained: true,
-      };
+      const completedModel = cloneNeuralModel(message.model as NeuralModel);
       trainedModel.value = completedModel;
-      const cumulativeEpochs = baseEpochs + trainingSettings.value.epochs;
+      const cumulativeEpochs = baseEpochs + settings.epochs;
       trainedEpochCount.value = cumulativeEpochs;
       trainingProgress.value = {
         ...trainingProgress.value,
         phase: "complete",
-        epoch: trainingSettings.value.epochs,
-        epochs: trainingSettings.value.epochs,
+        epoch: settings.epochs,
+        epochs: settings.epochs,
         accuracy: message.accuracy,
         elapsedMs: message.elapsedMs,
       };
@@ -687,10 +829,11 @@ function startTraining(mode: TrainingMode = "scratch") {
       datasetUrl: `${import.meta.env.BASE_URL}mnist-training.bin`,
       mnistEnabled: mnistEnabled.value,
       layers: hiddenLayers.value.map((layer) => ({ ...layer })),
-      settings: {
-        ...trainingSettings.value,
-        optimizer: { ...trainingSettings.value.optimizer },
-      },
+      convolutions: convolutions.value.map((convolution) => ({
+        ...convolution,
+        kernels: convolution.kernels.map((kernel) => [...kernel]),
+      })),
+      settings,
       initialModel,
       customSamples: customSamples.value.map((sample) => ({
         ...sample,
@@ -747,6 +890,7 @@ function resetArchitecture() {
   trainedModel.value = null;
   trainedEpochCount.value = 0;
   hiddenLayers.value = defaultLayers();
+  convolutions.value = [];
   selectedLayer.value = 1;
 }
 
@@ -760,13 +904,35 @@ watch(
     trainingProgress.value = {
       phase: "idle",
       epoch: 0,
-      epochs: trainingSettings.value.epochs,
+      epochs: trainingProfiles.value.scratch.epochs,
       accuracy: 0,
       loss: 0,
       elapsedMs: 0,
     };
     localStorage.setItem("watchneuron-architecture", JSON.stringify(layers));
-    selectedLayer.value = Math.min(selectedLayer.value, layers.length + 1);
+    selectedLayer.value = Math.min(selectedLayer.value, layerSizes.value.length - 1);
+    nextTick(runInference);
+  },
+  { deep: true },
+);
+
+watch(
+  convolutions,
+  (configs) => {
+    if (trainingWorker) cancelTraining();
+    trainingTrace.value = null;
+    trainedModel.value = null;
+    trainedEpochCount.value = 0;
+    trainingProgress.value = {
+      phase: "idle",
+      epoch: 0,
+      epochs: trainingProfiles.value.scratch.epochs,
+      accuracy: 0,
+      loss: 0,
+      elapsedMs: 0,
+    };
+    localStorage.setItem("watchneuron-convolutions", JSON.stringify(configs));
+    selectedLayer.value = Math.min(selectedLayer.value, layerSizes.value.length - 1);
     nextTick(runInference);
   },
   { deep: true },
@@ -789,11 +955,19 @@ watch(mnistEnabled, (enabled) => {
 });
 
 watch(
-  trainingSettings,
-  (settings) => {
-    localStorage.setItem("watchneuron-training-settings", JSON.stringify(settings));
+  trainingProfiles,
+  (profiles) => {
+    localStorage.setItem("watchneuron-training-settings", JSON.stringify(profiles));
   },
   { deep: true },
+);
+
+watch(
+  () => trainingProfiles.value.mathMode,
+  (mode) => {
+    engine.setMathMode(mode);
+    nextTick(runInference);
+  },
 );
 
 watch(trainingFlowActive, (active) => {
@@ -805,7 +979,7 @@ watch(trainingFlowActive, (active) => {
 
 async function loadModelLibrary() {
   try {
-    savedModels.value = await listSavedModels();
+    savedModels.value = (await listSavedModels()).map(normalizeSavedModelRecord);
   } catch {
     savedModels.value = [];
   } finally {
@@ -822,6 +996,7 @@ onMounted(async () => {
       loadModelLibrary(),
     ]);
     serialized.value = (await modelResponse.json()) as SerializedModel;
+    engine.setMathMode(trainingProfiles.value.mathMode);
     engineBackend.value = engine.backend;
     await nextTick();
     digitCanvas.value?.loadSample(serialized.value.samples[sampleCursor.value]);
@@ -845,7 +1020,7 @@ onBeforeUnmount(() => {
         </span>
         <div>
           <strong>WatchNeuron</strong>
-          <span>{{ activeView === "lab" ? "数字识别实验台" : activeView === "samples" ? "自定义样本库" : activeView === "models" ? "本地模型库" : "优化器配置" }}</span>
+          <span>{{ activeView === "lab" ? "数字识别实验台" : activeView === "signals" ? "逐层信号检查" : activeView === "samples" ? "自定义样本库" : activeView === "models" ? "本地模型库" : "优化器配置" }}</span>
         </div>
       </div>
 
@@ -860,6 +1035,16 @@ onBeforeUnmount(() => {
           >
             <Activity :size="15" />
             <span>实验台</span>
+          </button>
+          <button
+            type="button"
+            title="信号流"
+            :class="{ active: activeView === 'signals' }"
+            :aria-current="activeView === 'signals' ? 'page' : undefined"
+            @click="navigateTo('signals')"
+          >
+            <ScanLine :size="15" />
+            <span>信号流</span>
           </button>
           <button
             type="button"
@@ -898,7 +1083,7 @@ onBeforeUnmount(() => {
         <div class="runtime-status">
           <span class="status-item">
             <Cpu :size="15" />
-            {{ engineBackend }}
+            {{ engineBackend }} · {{ trainingProfiles.mathMode === "full" ? "完整" : "快速" }}
             <i class="status-dot" />
           </span>
           <span class="status-item latency-item">
@@ -991,6 +1176,7 @@ onBeforeUnmount(() => {
         <div class="network-stage">
           <NetworkCanvas
             :layers="hiddenLayers"
+            :convolutions="convolutions"
             :activations="flowActivations"
             :gradients="flowGradients"
             :model="model"
@@ -1053,13 +1239,18 @@ onBeforeUnmount(() => {
         />
         <ArchitectureEditor
           :layers="hiddenLayers"
+          :convolutions="convolutions"
           :parameter-count="parameterCount"
           @update="updateLayers"
+          @update-convolutions="updateConvolutions"
+          @reorder="reorderArchitecture"
           @reset="resetArchitecture"
         />
         <TrainingPanel
           :layers="hiddenLayers"
-          :settings="trainingSettings"
+          :convolutions="convolutions"
+          :backend="engineBackend"
+          :profiles="trainingProfiles"
           :progress="trainingProgress"
           :custom-training-count="customTrainingCount"
           :custom-test-count="customTestCount"
@@ -1069,7 +1260,7 @@ onBeforeUnmount(() => {
           :trained-epochs="trainedEpochCount"
           :mode="activeTrainingMode"
           @update="updateTrainingSettings"
-          @configure-optimizer="navigateTo('optimizer')"
+          @configure-optimizer="openOptimizer"
           @train="startTraining"
           @fine-tune="startFineTuning"
           @pause="pauseTraining"
@@ -1079,6 +1270,21 @@ onBeforeUnmount(() => {
         />
       </aside>
     </main>
+
+    <SignalFlowExplorer
+      v-if="activeView === 'signals'"
+      :layers="hiddenLayers"
+      :convolutions="convolutions"
+      :model="model"
+      :activations="flowActivations"
+      :gradients="flowGradients"
+      :training="trainingFlowActive"
+      :progress="trainingProgress"
+      :trace="trainingTrace"
+      @back="navigateTo('lab')"
+      @pause-training="pauseTraining"
+      @resume-training="resumeTraining"
+    />
 
     <DatasetManager
       v-if="activeView === 'samples'"
@@ -1096,24 +1302,27 @@ onBeforeUnmount(() => {
       v-if="activeView === 'models'"
       :models="savedModels"
       :loading="modelLibraryLoading"
+      :deleting="modelLibraryDeleting"
       @back="navigateTo('lab')"
       @load="loadSavedModel"
       @rename="renameSavedModel"
-      @remove="removeSavedModel"
+      @remove-many="removeSavedModels"
     />
 
     <OptimizerManager
       v-if="activeView === 'optimizer'"
-      :settings="trainingSettings"
+      :profiles="trainingProfiles"
+      :initial-mode="optimizerViewMode"
       :locked="datasetLocked"
       @back="navigateTo('lab')"
+      @mode="optimizerViewMode = $event"
       @update="updateTrainingSettings"
     />
 
     <footer class="statusbar">
-      <span><i class="status-dot" /> {{ activeView === "lab" ? "引擎就绪" : activeView === "samples" ? `${customSamples.length} 个自定义样本` : activeView === "models" ? `${savedModels.length} 个本地模型` : `${trainingSettings.optimizer.kind.toUpperCase()} 已选择` }}</span>
-      <span>{{ activeView === "lab" ? "FP32 · Zig/Wasm" : activeView === "samples" ? `训练 ${customTrainingCount} · 测试 ${customTestCount}` : activeView === "models" ? "FP32 · IndexedDB" : `学习率 ${trainingSettings.learningRate}` }}</span>
-      <span>{{ activeView === "lab" ? "本地推理 · 本地训练" : activeView === "samples" ? (mnistEnabled ? "MNIST 已启用" : "仅自定义样本") : activeView === "models" ? "训练完成自动保存" : "5 种 Zig/Wasm 优化器" }}</span>
+      <span><i class="status-dot" /> {{ activeView === "lab" ? "引擎就绪" : activeView === "signals" ? (trainingFlowActive ? "训练信号已接入" : "推理信号已接入") : activeView === "samples" ? `${customSamples.length} 个自定义样本` : activeView === "models" ? `${savedModels.length} 个本地模型` : `重训 ${trainingProfiles.scratch.optimizer.kind.toUpperCase()} · 微调 ${trainingProfiles.finetune.optimizer.kind.toUpperCase()}` }}</span>
+      <span>{{ activeView === "lab" ? `FP32 · ${engineBackend} · ${trainingProfiles.mathMode === "full" ? "完整" : "快速"}` : activeView === "signals" ? `${layerSizes.length} 层 · FP32` : activeView === "samples" ? `训练 ${customTrainingCount} · 测试 ${customTestCount}` : activeView === "models" ? "FP32 · IndexedDB" : `学习率 ${trainingProfiles.scratch.learningRate} / ${trainingProfiles.finetune.learningRate}` }}</span>
+      <span>{{ activeView === "lab" ? "本地推理 · 本地训练" : activeView === "signals" ? (trainingProgress.phase === "paused" ? "训练已暂停" : "实时逐层采样") : activeView === "samples" ? (mnistEnabled ? "MNIST 已启用" : "仅自定义样本") : activeView === "models" ? "训练完成自动保存" : "5 种 Zig/Wasm 优化器" }}</span>
     </footer>
   </div>
 </template>

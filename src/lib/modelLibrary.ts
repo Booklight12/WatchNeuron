@@ -53,7 +53,27 @@ export function saveModelRecord(model: SavedModel) {
 }
 
 export function deleteModelRecord(id: string) {
-  return runRequest<undefined>("readwrite", (store) => store.delete(id));
+  return deleteModelRecords([id]);
+}
+
+export async function deleteModelRecords(ids: string[]) {
+  const uniqueIds = [...new Set(ids)];
+  if (!uniqueIds.length) return;
+
+  const database = await openDatabase();
+  return new Promise<void>((resolve, reject) => {
+    const transaction = database.transaction(MODEL_STORE, "readwrite");
+    const store = transaction.objectStore(MODEL_STORE);
+    uniqueIds.forEach((id) => store.delete(id));
+    transaction.oncomplete = () => {
+      database.close();
+      resolve();
+    };
+    transaction.onabort = () => {
+      database.close();
+      reject(transaction.error ?? new Error("无法删除模型"));
+    };
+  });
 }
 
 export async function renameModelRecord(id: string, name: string) {

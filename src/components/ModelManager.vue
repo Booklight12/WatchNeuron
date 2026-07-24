@@ -1,28 +1,31 @@
 <script setup lang="ts">
-import { computed, nextTick, ref } from "vue";
+import { computed, nextTick, ref, watch } from "vue";
 import {
   ArrowLeft,
   BrainCircuit,
   Check,
   Database,
+  ListChecks,
   PencilLine,
   Play,
   Trash2,
   X,
 } from "@lucide/vue";
 import { activationLabels } from "../lib/model";
+import { modelConvolutions } from "../lib/convolution";
 import type { SavedModel, SavedModelSource } from "../types";
 
 const props = defineProps<{
   models: SavedModel[];
   loading: boolean;
+  deleting: boolean;
 }>();
 
 const emit = defineEmits<{
   back: [];
   load: [model: SavedModel];
   rename: [id: string, name: string];
-  remove: [id: string];
+  removeMany: [ids: string[]];
 }>();
 
 type ModelFilter = "all" | SavedModelSource;
@@ -30,10 +33,34 @@ type ModelFilter = "all" | SavedModelSource;
 const filter = ref<ModelFilter>("all");
 const editingId = ref<string | null>(null);
 const draftName = ref("");
+const selectionMode = ref(false);
+const selectedIds = ref<Set<string>>(new Set());
+const pendingDeleteIds = ref<string[]>([]);
+const deleteSubmitted = ref(false);
 
 const filteredModels = computed(() =>
   props.models.filter((model) => filter.value === "all" || model.source === filter.value),
 );
+const visibleIds = computed(() => filteredModels.value.map((model) => model.id));
+const allVisibleSelected = computed(
+  () =>
+    visibleIds.value.length > 0 &&
+    visibleIds.value.every((id) => selectedIds.value.has(id)),
+);
+const someVisibleSelected = computed(
+  () =>
+    !allVisibleSelected.value &&
+    visibleIds.value.some((id) => selectedIds.value.has(id)),
+);
+const selectedCount = computed(() => selectedIds.value.size);
+const pendingDeleteModels = computed(() => {
+  const ids = new Set(pendingDeleteIds.value);
+  return props.models.filter((model) => ids.has(model.id));
+});
+const pendingDeleteLabel = computed(() => {
+  if (pendingDeleteModels.value.length === 1) return `“${pendingDeleteModels.value[0].name}”`;
+  return `${pendingDeleteModels.value.length} 个模型`;
+});
 const completeCount = computed(
   () => props.models.filter((model) => model.source === "complete").length,
 );
@@ -45,15 +72,23 @@ const totalBytes = computed(() =>
 );
 
 function parameterCount(model: SavedModel) {
-  return model.model.layers.reduce(
+  const dense = model.model.layers.reduce(
     (total, layer) => total + layer.weights.length + layer.biases.length,
+    0,
+  );
+  return dense + modelConvolutions(model.model).reduce(
+    (total, convolution) => total + convolution.weights.length + convolution.biases.length,
     0,
   );
 }
 
 function modelBytes(model: SavedModel) {
-  return model.model.layers.reduce(
+  const dense = model.model.layers.reduce(
     (total, layer) => total + layer.weights.byteLength + layer.biases.byteLength,
+    0,
+  );
+  return dense + modelConvolutions(model.model).reduce(
+    (total, convolution) => total + convolution.weights.byteLength + convolution.biases.byteLength,
     0,
   );
 }
@@ -79,6 +114,23 @@ function modelSourceLabel(model: SavedModel) {
   return model.source === "complete" ? "完整训练" : "暂停快照";
 }
 
+function architectureItems(model: SavedModel) {
+  const items = ["784"];
+  const convolutions = modelConvolutions(model.model);
+  for (let position = 0; position <= model.hiddenLayers.length; position++) {
+    for (const convolution of convolutions.filter((item) => item.position === position)) {
+      items.push(`Conv2D ${convolution.filters}×${convolution.kernelSize}²`);
+    }
+    if (position < model.hiddenLayers.length) {
+      const layer = model.hiddenLayers[position];
+      const dropout = layer.dropout > 0 ? ` · D${Math.round(layer.dropout * 100)}%` : "";
+      items.push(`${layer.units} · ${activationLabels[layer.activation]}${dropout}`);
+    }
+  }
+  items.push("10 · Softmax");
+  return items;
+}
+
 function beginRename(model: SavedModel) {
   editingId.value = model.id;
   draftName.value = model.name;
@@ -95,10 +147,62 @@ function finishRename(model: SavedModel) {
   editingId.value = null;
 }
 
-function removeModel(model: SavedModel) {
-  if (!window.confirm(`删除模型“${model.name}”？`)) return;
-  emit("remove", model.id);
+function setSelection(id: string, selected: boolean) {
+  const next = new Set(selectedIds.value);
+  if (selected) next.add(id);
+  else next.delete(id);
+  selectedIds.value = next;
 }
+
+function toggleVisibleSelection() {
+  const next = new Set(selectedIds.value);
+  if (allVisibleSelected.value) visibleIds.value.forEach((id) => next.delete(id));
+  else visibleIds.value.forEach((id) => next.add(id));
+  selectedIds.value = next;
+}
+
+function toggleSelectionMode() {
+  selectionMode.value = !selectionMode.value;
+  if (!selectionMode.value) {
+    selectedIds.value = new Set();
+    pendingDeleteIds.value = [];
+  }
+}
+
+function clearSelection() {
+  selectedIds.value = new Set();
+}
+
+function requestDelete(ids: string[]) {
+  const available = new Set(props.models.map((model) => model.id));
+  pendingDeleteIds.value = [...new Set(ids)].filter((id) => available.has(id));
+  deleteSubmitted.value = false;
+}
+
+function confirmDelete() {
+  if (props.deleting || !pendingDeleteIds.value.length) return;
+  deleteSubmitted.value = true;
+  emit("removeMany", [...pendingDeleteIds.value]);
+}
+
+watch(
+  () => props.models.map((model) => model.id),
+  (ids) => {
+    const available = new Set(ids);
+    selectedIds.value = new Set([...selectedIds.value].filter((id) => available.has(id)));
+    pendingDeleteIds.value = pendingDeleteIds.value.filter((id) => available.has(id));
+  },
+);
+
+watch(
+  () => props.deleting,
+  (deleting) => {
+    if (!deleting && deleteSubmitted.value) {
+      pendingDeleteIds.value = [];
+      deleteSubmitted.value = false;
+    }
+  },
+);
 </script>
 
 <template>
@@ -131,26 +235,120 @@ function removeModel(model: SavedModel) {
       <div><span>权重占用</span><strong>{{ formatBytes(totalBytes) }}</strong></div>
     </section>
 
-    <section class="sample-manager-toolbar model-manager-toolbar" aria-label="模型筛选">
+    <section class="sample-manager-toolbar model-manager-toolbar" aria-label="模型筛选和批量操作">
       <div class="sample-filter-tabs" role="group" aria-label="模型类型筛选">
         <button type="button" :class="{ active: filter === 'all' }" @click="filter = 'all'">全部</button>
         <button type="button" :class="{ active: filter === 'complete' }" @click="filter = 'complete'">完整训练</button>
         <button type="button" :class="{ active: filter === 'paused' }" @click="filter = 'paused'">暂停快照</button>
       </div>
-      <span>{{ filteredModels.length }} 个结果</span>
+
+      <span class="model-toolbar-result">{{ filteredModels.length }} 个结果</span>
+
+      <button
+        v-if="!selectionMode"
+        class="tool-button model-selection-toggle"
+        type="button"
+        :disabled="!models.length || deleting"
+        @click="toggleSelectionMode"
+      >
+        <ListChecks :size="15" />
+        批量管理
+      </button>
+      <template v-else>
+        <label class="select-visible-control" :class="{ disabled: visibleIds.length === 0 || deleting }">
+          <input
+            type="checkbox"
+            :checked="allVisibleSelected"
+            :indeterminate="someVisibleSelected"
+            :disabled="visibleIds.length === 0 || deleting"
+            @change="toggleVisibleSelection"
+          />
+          <span>选择当前</span>
+        </label>
+        <span class="toolbar-selection-count">已选 {{ selectedCount }}</span>
+        <button
+          class="tool-button model-clear-selection"
+          type="button"
+          :disabled="selectedCount === 0 || deleting"
+          @click="clearSelection"
+        >
+          <X :size="15" />
+          清除
+        </button>
+        <button
+          class="tool-button remove-selected-button"
+          type="button"
+          :disabled="selectedCount === 0 || deleting"
+          @click="requestDelete([...selectedIds])"
+        >
+          <Trash2 :size="15" />
+          删除所选
+        </button>
+        <button
+          class="tool-button model-selection-done"
+          type="button"
+          :disabled="deleting"
+          @click="toggleSelectionMode"
+        >
+          <Check :size="15" />
+          完成
+        </button>
+      </template>
+    </section>
+
+    <section
+      v-if="pendingDeleteIds.length"
+      class="model-delete-confirm"
+      aria-live="polite"
+      aria-label="确认删除模型"
+    >
+      <div class="model-delete-confirm-copy">
+        <span><Trash2 :size="16" /></span>
+        <div>
+          <strong>删除 {{ pendingDeleteLabel }}？</strong>
+          <p>模型权重和训练进度将从此浏览器永久移除。</p>
+        </div>
+      </div>
+      <div class="model-delete-confirm-actions">
+        <button type="button" :disabled="deleting" @click="pendingDeleteIds = []">
+          <X :size="15" />
+          取消
+        </button>
+        <button class="confirm" type="button" :disabled="deleting" @click="confirmDelete">
+          <Trash2 :size="15" />
+          {{ deleting ? "正在删除" : "确认删除" }}
+        </button>
+      </div>
     </section>
 
     <section v-if="filteredModels.length" class="model-list" aria-label="已保存模型列表">
-      <article v-for="model in filteredModels" :key="model.id" class="model-card">
+      <article
+        v-for="model in filteredModels"
+        :key="model.id"
+        class="model-card"
+        :class="{ selected: selectedIds.has(model.id), 'selection-mode': selectionMode }"
+      >
         <div class="model-card-main">
-          <span
-            class="model-source"
-            :class="[model.source, { finetune: model.trainingMode === 'finetune' }]"
-          >
-            <Check v-if="model.source === 'complete'" :size="13" />
-            <BrainCircuit v-else :size="13" />
-            {{ modelSourceLabel(model) }}
-          </span>
+          <div class="model-card-meta">
+            <label v-if="selectionMode" class="model-select-control">
+              <input
+                type="checkbox"
+                :checked="selectedIds.has(model.id)"
+                :disabled="deleting"
+                :aria-label="`选择模型 ${model.name}`"
+                @change="setSelection(model.id, ($event.target as HTMLInputElement).checked)"
+              />
+              <span>{{ selectedIds.has(model.id) ? "已选择" : "选择" }}</span>
+            </label>
+            <span
+              class="model-source"
+              :class="[model.source, { finetune: model.trainingMode === 'finetune' }]"
+            >
+              <Check v-if="model.source === 'complete'" :size="13" />
+              <BrainCircuit v-else :size="13" />
+              {{ modelSourceLabel(model) }}
+            </span>
+          </div>
 
           <div v-if="editingId === model.id" class="model-name-editor">
             <input
@@ -175,13 +373,10 @@ function removeModel(model: SavedModel) {
           </div>
 
           <div class="model-architecture" aria-label="模型架构">
-            <span>784</span>
-            <template v-for="layer in model.hiddenLayers" :key="layer.id">
-              <i>→</i>
-              <span>{{ layer.units }} · {{ activationLabels[layer.activation] }}</span>
+            <template v-for="(item, index) in architectureItems(model)" :key="`${index}-${item}`">
+              <i v-if="index">→</i>
+              <span>{{ item }}</span>
             </template>
-            <i>→</i>
-            <span>10 · Softmax</span>
           </div>
 
           <dl class="model-card-metrics">
@@ -215,7 +410,8 @@ function removeModel(model: SavedModel) {
             type="button"
             title="删除模型"
             aria-label="删除模型"
-            @click="removeModel(model)"
+            :disabled="deleting"
+            @click="requestDelete([model.id])"
           >
             <Trash2 :size="15" />
           </button>

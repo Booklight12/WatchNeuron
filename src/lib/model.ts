@@ -1,10 +1,19 @@
 import type {
   ActivationKind,
+  ConvolutionConfig,
+  ConvolutionLayerData,
   DenseLayerData,
   HiddenLayer,
   NeuralModel,
   SerializedModel,
 } from "../types";
+import {
+  convolutionOutputShape,
+  convolutionPipeline,
+  fitConvolutionsToLayers,
+  modelConvolutions,
+  type FeatureMapShape,
+} from "./convolution";
 
 function seededRandom(seed: number) {
   let state = seed >>> 0;
@@ -57,29 +66,21 @@ function copyRows(
 export function buildModel(
   base: SerializedModel,
   hiddenLayers: HiddenLayer[],
+  convolutionConfigs: ConvolutionConfig[] = [],
 ): NeuralModel {
   const layers: DenseLayerData[] = [];
   const defaultHiddenSize = base.architecture[1];
-  const firstLayer = hiddenLayers[0];
-  const firstWeights = makeWeights(
-    firstLayer.units,
-    784,
-    0x1337 + firstLayer.units,
-    firstLayer.activation,
+  const normalizedConvolutions = fitConvolutionsToLayers(convolutionConfigs, hiddenLayers);
+  const convolutionEntries = convolutionPipeline(hiddenLayers, normalizedConvolutions);
+  const convolutions = convolutionEntries.map(({ config, input }) =>
+    buildConvolutionLayer(config, input),
   );
-  const firstBiases = new Float32Array(firstLayer.units);
-  copyRows(firstWeights, base.weights[0], firstLayer.units, 784, defaultHiddenSize, 784);
-  firstBiases.set(base.biases[0].slice(0, firstLayer.units));
-  layers.push({
-    inputSize: 784,
-    outputSize: firstLayer.units,
-    activation: firstLayer.activation,
-    weights: firstWeights,
-    biases: firstBiases,
-  });
+  let previousSize = 784;
 
-  for (let index = 1; index < hiddenLayers.length; index++) {
-    const previousSize = hiddenLayers[index - 1].units;
+  for (let index = 0; index < hiddenLayers.length; index++) {
+    for (const convolution of convolutions.filter((item) => item.position === index)) {
+      previousSize = convolution.outputWidth * convolution.outputHeight * convolution.filters;
+    }
     const current = hiddenLayers[index];
     const weights = makeWeights(
       current.units,
@@ -87,24 +88,33 @@ export function buildModel(
       0x2459 + index * 97 + current.units,
       current.activation,
     );
-    weights.fill(0);
-    for (let unit = 0; unit < Math.min(previousSize, current.units); unit++) {
-      weights[unit * previousSize + unit] = 1;
+    const biases = new Float32Array(current.units);
+    if (index === 0 && previousSize === 784) {
+      copyRows(weights, base.weights[0], current.units, 784, defaultHiddenSize, 784);
+      biases.set(base.biases[0].slice(0, current.units));
+    } else if (index > 0) {
+      weights.fill(0);
+      for (let unit = 0; unit < Math.min(previousSize, current.units); unit++) {
+        weights[unit * previousSize + unit] = 1;
+      }
     }
     layers.push({
       inputSize: previousSize,
       outputSize: current.units,
       activation: current.activation,
       weights,
-      biases: new Float32Array(current.units),
+      biases,
     });
+    previousSize = current.units;
   }
 
-  const lastSize = hiddenLayers.at(-1)?.units ?? defaultHiddenSize;
-  const outputWeights = makeWeights(10, lastSize, 0x7810 + lastSize, "linear");
-  copyRows(outputWeights, base.weights[1], 10, lastSize, 10, defaultHiddenSize);
+  for (const convolution of convolutions.filter((item) => item.position === hiddenLayers.length)) {
+    previousSize = convolution.outputWidth * convolution.outputHeight * convolution.filters;
+  }
+  const outputWeights = makeWeights(10, previousSize, 0x7810 + previousSize, "linear");
+  copyRows(outputWeights, base.weights[1], 10, previousSize, 10, defaultHiddenSize);
   layers.push({
-    inputSize: lastSize,
+    inputSize: previousSize,
     outputSize: 10,
     activation: "linear",
     weights: outputWeights,
@@ -112,8 +122,10 @@ export function buildModel(
   });
 
   return {
+    convolutions,
     layers,
     calibrated:
+      convolutions.length === 0 &&
       hiddenLayers.length === 1 &&
       hiddenLayers[0].units === defaultHiddenSize &&
       hiddenLayers[0].activation === "relu",
@@ -121,10 +133,49 @@ export function buildModel(
 }
 
 export function countParameters(model: NeuralModel) {
-  return model.layers.reduce(
+  const denseParameters = model.layers.reduce(
     (total, layer) => total + layer.weights.length + layer.biases.length,
     0,
   );
+  return denseParameters + modelConvolutions(model).reduce(
+    (total, convolution) => total + convolution.weights.length + convolution.biases.length,
+    0,
+  );
+}
+
+function buildConvolutionLayer(
+  config: ConvolutionConfig,
+  input: FeatureMapShape,
+): ConvolutionLayerData {
+  const output = convolutionOutputShape(config, input);
+  const kernelLength = config.kernelSize * config.kernelSize;
+  const expectedWeights = config.filters * input.channels * kernelLength;
+  const weights = new Float32Array(expectedWeights);
+  for (let filter = 0; filter < config.filters; filter++) {
+    const kernel = config.kernels[filter] ?? [];
+    for (let channel = 0; channel < input.channels; channel++) {
+      for (let index = 0; index < kernelLength; index++) {
+        weights[(filter * input.channels + channel) * kernelLength + index] =
+          Number.isFinite(kernel[index]) ? kernel[index] : 0;
+      }
+    }
+  }
+  return {
+    id: config.id,
+    position: config.position,
+    inputWidth: input.width,
+    inputHeight: input.height,
+    inputChannels: input.channels,
+    outputWidth: output.width,
+    outputHeight: output.height,
+    filters: config.filters,
+    kernelSize: config.kernelSize,
+    stride: config.stride,
+    padding: config.padding,
+    activation: config.activation,
+    weights,
+    biases: new Float32Array(config.filters),
+  };
 }
 
 export const activationLabels: Record<ActivationKind, string> = {

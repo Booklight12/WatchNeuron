@@ -14,9 +14,12 @@ const wrapperSource = `
   globalThis.self = globalThis;
   globalThis.postMessage = (message, transfer) => parentPort.postMessage(message, transfer);
   globalThis.fetch = async (url) => {
-    const data = await readFile(String(url).includes("neuron_kernel.wasm")
-      ? workerData.wasmPath
-      : workerData.datasetPath);
+    const value = String(url);
+    const data = await readFile(value.includes("neuron_kernel_simd.wasm")
+      ? workerData.simdWasmPath
+      : value.includes(".wasm")
+        ? workerData.wasmPath
+        : workerData.datasetPath);
     return {
       ok: true,
       arrayBuffer: async () => data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength),
@@ -34,6 +37,7 @@ const worker = new Worker(
     workerData: {
       datasetPath: resolve("public", "mnist-training.bin"),
       wasmPath: resolve("public", "neuron_kernel.wasm"),
+      simdWasmPath: resolve("public", "neuron_kernel_simd.wasm"),
       workerUrl: pathToFileURL(resolve("dist", "assets", workerAsset)).href,
     },
   },
@@ -66,6 +70,35 @@ const optimizerConfig = (kind) => ({
   decay: 0.9,
   epsilon: 1e-8,
 });
+const noConvolution = {
+  enabled: false,
+  position: 0,
+  filters: 4,
+  kernelSize: 3,
+  stride: 1,
+  padding: 1,
+  activation: "relu",
+  kernels: [],
+};
+const convolutionConfig = {
+  id: "conv-primary",
+  enabled: true,
+  position: 0,
+  filters: 2,
+  kernelSize: 3,
+  stride: 2,
+  padding: 1,
+  activation: "relu",
+  kernels: [
+    [0, -1, 0, -1, 4, -1, 0, -1, 0],
+    [-1, 0, 1, -1, 0, 1, -1, 0, 1],
+  ],
+};
+const multipleConvolutionConfigs = [
+  { ...convolutionConfig, id: "conv-stack-a", position: 0, filters: 2 },
+  { ...convolutionConfig, id: "conv-stack-b", position: 0, filters: 2 },
+  { ...convolutionConfig, id: "conv-stack-c", position: 1, filters: 2, stride: 1 },
+];
 const customSamples = [
   {
     id: "custom-training-probe",
@@ -93,6 +126,16 @@ let verificationStage = "activations";
 let baselineModel = null;
 let fineTuneVerified = false;
 let customOnlyVerified = false;
+let convolutionVerified = false;
+let convolutionFineTuneVerified = false;
+let middleConvolutionVerified = false;
+let middleConvolutionTraceVerified = false;
+let dropoutVerified = false;
+let convolutionBaseline = null;
+let multipleConvolutionBaseline = null;
+let multipleConvolutionVerified = false;
+let multipleConvolutionFineTuneVerified = false;
+let multipleConvolutionTraceVerified = false;
 let wasmBackendVerified = false;
 const verifiedOptimizers = new Set();
 const accuracies = [];
@@ -104,7 +147,10 @@ const completed = new Promise((resolvePromise, rejectPromise) => {
   );
 
   function currentActivation() {
-    return verificationStage === "activations" ? activationKinds[activationIndex] : "relu";
+    if (verificationStage === "activations") return activationKinds[activationIndex];
+    if (verificationStage === "convolution-middle" || verificationStage.startsWith("convolution-multiple")) return "relu";
+    if (verificationStage.startsWith("convolution")) return "sigmoid";
+    return "relu";
   }
 
   function startCurrentActivation() {
@@ -114,7 +160,8 @@ const completed = new Promise((resolvePromise, rejectPromise) => {
     worker.postMessage({
       type: "train",
       datasetUrl: "/mnist-training.bin",
-      layers: [{ id: `${activation}-test`, units: 12, activation }],
+      layers: [{ id: `${activation}-test`, units: 12, activation, dropout: 0 }],
+      convolution: noConvolution,
       settings: {
         epochs: 1,
         learningRate: activationIndex === 0
@@ -122,6 +169,7 @@ const completed = new Promise((resolvePromise, rejectPromise) => {
           : ["adam", "rmsprop"].includes(optimizerKind)
             ? 0.003
             : 0.01,
+        mathMode: "fast",
         optimizer: optimizerConfig(optimizerKind),
       },
       customSamples,
@@ -135,10 +183,12 @@ const completed = new Promise((resolvePromise, rejectPromise) => {
     worker.postMessage({
       type: "train",
       datasetUrl: "/mnist-training.bin",
-      layers: [{ id: "relu-finetune", units: 12, activation: "relu" }],
+      layers: [{ id: "relu-finetune", units: 12, activation: "relu", dropout: 0 }],
+      convolution: noConvolution,
       settings: {
         epochs: 1,
         learningRate: 0.003,
+        mathMode: "fast",
         optimizer: optimizerConfig("adam"),
       },
       initialModel: baselineModel,
@@ -153,12 +203,76 @@ const completed = new Promise((resolvePromise, rejectPromise) => {
       type: "train",
       datasetUrl: "/mnist-training.bin",
       mnistEnabled: false,
-      layers: [{ id: "custom-only", units: 12, activation: "relu" }],
+      layers: [{ id: "custom-only", units: 12, activation: "relu", dropout: 0 }],
+      convolution: noConvolution,
       settings: {
         epochs: 1,
         learningRate: 0.01,
+        mathMode: "fast",
         optimizer: optimizerConfig("adagrad"),
       },
+      customSamples: customSamples.filter((sample) => sample.split === "training"),
+    });
+  }
+
+  function startConvolutionTraining(initialModel) {
+    verificationStage = initialModel ? "convolution-finetune" : "convolution";
+    sawValidTrace = false;
+    worker.postMessage({
+      type: "train",
+      datasetUrl: "/mnist-training.bin",
+      mnistEnabled: false,
+      layers: [{ id: "conv-dropout", units: 12, activation: "sigmoid", dropout: 0.5 }],
+      convolutions: [convolutionConfig],
+      settings: {
+        epochs: 1,
+        learningRate: 0.003,
+        mathMode: "fast",
+        optimizer: optimizerConfig("adam"),
+      },
+      initialModel,
+      customSamples: customSamples.filter((sample) => sample.split === "training"),
+    });
+  }
+
+  function startMiddleConvolutionTraining() {
+    verificationStage = "convolution-middle";
+    sawValidTrace = false;
+    worker.postMessage({
+      type: "train",
+      datasetUrl: "/mnist-training.bin",
+      mnistEnabled: false,
+      layers: [
+        { id: "before-conv", units: 12, activation: "relu", dropout: 0.25 },
+        { id: "after-conv", units: 10, activation: "tanh", dropout: 0 },
+      ],
+      convolutions: [{ ...convolutionConfig, id: "conv-middle", position: 1 }],
+      settings: {
+        epochs: 1,
+        learningRate: 0.003,
+        mathMode: "full",
+        optimizer: optimizerConfig("adam"),
+      },
+      customSamples: customSamples.filter((sample) => sample.split === "training"),
+    });
+  }
+
+  function startMultipleConvolutionTraining(initialModel) {
+    verificationStage = initialModel ? "convolution-multiple-finetune" : "convolution-multiple";
+    sawValidTrace = false;
+    worker.postMessage({
+      type: "train",
+      datasetUrl: "/mnist-training.bin",
+      mnistEnabled: false,
+      layers: [{ id: "between-convs", units: 12, activation: "relu", dropout: 0 }],
+      convolutions: multipleConvolutionConfigs,
+      settings: {
+        epochs: 1,
+        learningRate: 0.003,
+        mathMode: "fast",
+        optimizer: optimizerConfig("adam"),
+      },
+      initialModel,
       customSamples: customSamples.filter((sample) => sample.split === "training"),
     });
   }
@@ -180,9 +294,10 @@ const completed = new Promise((resolvePromise, rejectPromise) => {
     }
 
     if (message.type === "trace") {
-      wasmBackendVerified ||= message.backend === "Zig/Wasm";
-      const activations = Array.from(message.activations[1]);
-      const gradients = Array.from(message.gradients[1]);
+      wasmBackendVerified ||= message.backend?.startsWith("Zig/Wasm SIMD");
+      const traceLayerIndex = verificationStage.startsWith("convolution") ? 2 : 1;
+      const activations = Array.from(message.activations[traceLayerIndex]);
+      const gradients = Array.from(message.gradients[traceLayerIndex]);
       const activation = currentActivation();
       const softmaxIsNormalized =
         activation !== "softmax" ||
@@ -190,9 +305,33 @@ const completed = new Promise((resolvePromise, rejectPromise) => {
       sawValidTrace ||=
         activations.every(Number.isFinite) &&
         softmaxIsNormalized &&
-        message.samples === (verificationStage === "custom-only" ? 1 : 4001) &&
+        message.samples === (verificationStage === "custom-only" || verificationStage.startsWith("convolution") ? 1 : 4001) &&
         gradients.every(Number.isFinite) &&
         gradients.some((value) => Math.abs(value) > 1e-10);
+      if (verificationStage.startsWith("convolution")) {
+        dropoutVerified ||= activations.some((value) => value === 0) && activations.some((value) => value !== 0);
+      }
+      if (verificationStage === "convolution-middle") {
+        middleConvolutionTraceVerified ||=
+          message.activations.length === 5 &&
+          message.gradients.length === 5 &&
+          message.activations[0].length === 784 &&
+          message.activations[1].length === 12 &&
+          message.activations[2].length === 8 &&
+          message.activations[3].length === 10 &&
+          message.activations[4].length === 10 &&
+          Array.from(message.gradients[1]).some((value) => Math.abs(value) > 1e-10) &&
+          Array.from(message.gradients[2]).some((value) => Math.abs(value) > 1e-10);
+      }
+      if (verificationStage.startsWith("convolution-multiple")) {
+        multipleConvolutionTraceVerified ||=
+          message.activations.length === 6 &&
+          message.gradients.length === 6 &&
+          [784, 392, 98, 12, 24, 10].every(
+            (length, index) => message.activations[index].length === length && message.gradients[index].length === length,
+          ) &&
+          message.gradients.every((values) => Array.from(values).every(Number.isFinite));
+      }
       if (verificationStage === "activations" && activationIndex === 0 && !pauseRequested) {
         pauseRequested = true;
         worker.postMessage({ type: "pause" });
@@ -207,7 +346,7 @@ const completed = new Promise((resolvePromise, rejectPromise) => {
     }
 
     if (message.type === "snapshot") {
-      const hiddenLayer = message.model[0];
+      const hiddenLayer = message.model.layers[0];
       snapshotVerified =
         message.epoch >= 1 &&
         message.sample >= 1 &&
@@ -225,14 +364,14 @@ const completed = new Promise((resolvePromise, rejectPromise) => {
 
     if (message.type === "complete") {
       trainingDurations.push(message.elapsedMs);
-      const hiddenLayer = message.model[0];
+      const hiddenLayer = message.model.layers[0];
       const valuesAreFinite = [
         ...hiddenLayer.weights,
         ...hiddenLayer.biases,
       ].every(Number.isFinite);
       const activation = currentActivation();
-      const expectedTrainingSamples = verificationStage === "custom-only" ? 1 : 4001;
-      const expectedTestSamples = verificationStage === "custom-only" ? 0 : 1001;
+      const expectedTrainingSamples = verificationStage === "custom-only" || verificationStage.startsWith("convolution") ? 1 : 4001;
+      const expectedTestSamples = verificationStage === "custom-only" || verificationStage.startsWith("convolution") ? 0 : 1001;
       if (
         !sawValidTrace ||
         hiddenLayer.activation !== activation ||
@@ -240,7 +379,9 @@ const completed = new Promise((resolvePromise, rejectPromise) => {
         !Number.isFinite(message.accuracy) ||
         message.trainingSamples !== expectedTrainingSamples ||
         message.testSamples !== expectedTestSamples ||
-        message.backend !== "Zig/Wasm" ||
+        message.backend !== (verificationStage === "convolution-middle"
+          ? "Zig/Wasm SIMD · 完整"
+          : "Zig/Wasm SIMD · 快速") ||
         (verificationStage === "activations" &&
           activationIndex === 0 &&
           (!pauseVerified || !snapshotVerified || !resumeVerified))
@@ -252,14 +393,106 @@ const completed = new Promise((resolvePromise, rejectPromise) => {
 
       if (verificationStage === "custom-only") {
         customOnlyVerified = true;
+        startConvolutionTraining(null);
+        return;
+      }
+
+      if (verificationStage === "convolution") {
+        const convolution = message.model.convolutions[0];
+        const initialWeights = convolutionConfig.kernels.flat();
+        const weightsChanged = convolution && Array.from(convolution.weights).some(
+          (value, index) => Math.abs(value - initialWeights[index]) > 1e-8,
+        );
+        if (!convolution || !weightsChanged || !dropoutVerified) {
+          clearTimeout(timeout);
+          rejectPromise(new Error("Conv2D or Dropout training did not update the expected state"));
+          return;
+        }
+        convolutionVerified = true;
+        convolutionBaseline = message.model;
+        startConvolutionTraining(convolutionBaseline);
+        return;
+      }
+
+      if (verificationStage === "convolution-finetune") {
+        const changed = Array.from(message.model.convolutions[0].weights).some(
+          (value, index) => Math.abs(value - convolutionBaseline.convolutions[0].weights[index]) > 1e-8,
+        );
+        if (!changed) {
+          clearTimeout(timeout);
+          rejectPromise(new Error("Loaded Conv2D model did not continue fine-tuning"));
+          return;
+        }
+        convolutionFineTuneVerified = true;
+        startMiddleConvolutionTraining();
+        return;
+      }
+
+      if (verificationStage === "convolution-middle") {
+        const convolution = message.model.convolutions[0];
+        const initialWeights = convolutionConfig.kernels.flat();
+        const weightsChanged = convolution && Array.from(convolution.weights).some(
+          (value, index) => Math.abs(value - initialWeights[index]) > 1e-8,
+        );
+        middleConvolutionVerified = Boolean(
+          convolution &&
+          convolution.position === 1 &&
+          convolution.inputWidth === 4 &&
+          convolution.inputHeight === 3 &&
+          weightsChanged &&
+          middleConvolutionTraceVerified,
+        );
+        if (!middleConvolutionVerified) {
+          clearTimeout(timeout);
+          rejectPromise(new Error("Middle Conv2D training did not propagate through both Dense segments"));
+          return;
+        }
+        startMultipleConvolutionTraining(null);
+        return;
+      }
+
+      if (verificationStage === "convolution-multiple") {
+        const changed = message.model.convolutions.every((convolution, convolutionIndex) => {
+          const config = multipleConvolutionConfigs[convolutionIndex];
+          const kernelLength = config.kernelSize ** 2;
+          return Array.from(convolution.weights).some((value, weightIndex) => {
+            const filter = Math.floor(weightIndex / (convolution.inputChannels * kernelLength));
+            const kernelIndex = weightIndex % kernelLength;
+            return Math.abs(value - config.kernels[filter][kernelIndex]) > 1e-8;
+          });
+        });
+        multipleConvolutionVerified =
+          message.model.convolutions.length === 3 && changed && multipleConvolutionTraceVerified;
+        if (!multipleConvolutionVerified) {
+          clearTimeout(timeout);
+          rejectPromise(new Error("Multiple Conv2D layers did not all receive finite gradients and weight updates"));
+          return;
+        }
+        multipleConvolutionBaseline = message.model;
+        startMultipleConvolutionTraining(multipleConvolutionBaseline);
+        return;
+      }
+
+      if (verificationStage === "convolution-multiple-finetune") {
+        const changed = message.model.convolutions.every((convolution, convolutionIndex) =>
+          Array.from(convolution.weights).some(
+            (value, index) => Math.abs(value - multipleConvolutionBaseline.convolutions[convolutionIndex].weights[index]) > 1e-8,
+          ),
+        );
+        multipleConvolutionFineTuneVerified = changed;
+        if (!multipleConvolutionFineTuneVerified) {
+          clearTimeout(timeout);
+          rejectPromise(new Error("Loaded multiple-Conv2D model did not continue fine-tuning"));
+          return;
+        }
         clearTimeout(timeout);
         resolvePromise();
         return;
       }
 
       if (verificationStage === "finetune") {
-        const weightsChanged = message.model.some((layer, layerIndex) => {
-          const baselineLayer = baselineModel[layerIndex];
+        const weightsChanged = message.model.layers.some((layer, layerIndex) => {
+          const baselineLayer = baselineModel.layers[layerIndex];
           return Array.from(layer.weights).some(
             (value, index) => Math.abs(value - baselineLayer.weights[index]) > 1e-8,
           ) || Array.from(layer.biases).some(
@@ -280,11 +513,7 @@ const completed = new Promise((resolvePromise, rejectPromise) => {
       verifiedOptimizers.add(optimizerKinds[activationIndex % optimizerKinds.length]);
 
       if (activationIndex === 0) {
-        baselineModel = message.model.map((layer) => ({
-          ...layer,
-          weights: Float32Array.from(layer.weights),
-          biases: Float32Array.from(layer.biases),
-        }));
+        baselineModel = message.model;
       }
       accuracies.push(message.accuracy);
       activationIndex++;
@@ -303,10 +532,10 @@ try {
   if (verifiedOptimizers.size !== optimizerKinds.length) {
     throw new Error("Not all optimizer implementations completed a training run");
   }
-  if (!wasmBackendVerified) throw new Error("Training traces did not report the Zig/Wasm backend");
+  if (!wasmBackendVerified) throw new Error("Training traces did not report the Zig/Wasm SIMD backend");
   const meanDuration = trainingDurations.reduce((sum, value) => sum + value, 0) / trainingDurations.length;
   console.log(
-    `Zig/Wasm training: ${activationKinds.length}/16 activations and ${verifiedOptimizers.size}/5 optimizers passed with pause/save/resume, ${fineTuneVerified ? "fine-tune continuation" : "fine-tune failure"}, and ${customOnlyVerified ? "custom-only dataset" : "custom-only failure"}; mean validation ${(meanAccuracy * 100).toFixed(1)}%; mean epoch ${meanDuration.toFixed(1)} ms`,
+    `Zig/Wasm SIMD training: fast/full math modes, ${activationKinds.length}/16 activations and ${verifiedOptimizers.size}/5 optimizers passed with pause/save/resume, ${fineTuneVerified ? "dense fine-tune" : "dense fine-tune failure"}, ${customOnlyVerified ? "custom-only dataset" : "custom-only failure"}, ${convolutionVerified ? "trainable Conv2D" : "Conv2D failure"}, ${dropoutVerified ? "Dropout" : "Dropout failure"}, ${convolutionFineTuneVerified ? "Conv2D fine-tune" : "Conv2D fine-tune failure"}, ${middleConvolutionVerified ? "middle-position Conv2D" : "middle-position Conv2D failure"}, ${multipleConvolutionVerified ? "multiple Conv2D" : "multiple Conv2D failure"}, and ${multipleConvolutionFineTuneVerified ? "multiple-Conv2D fine-tune" : "multiple-Conv2D fine-tune failure"}; mean validation ${(meanAccuracy * 100).toFixed(1)}%; mean epoch ${meanDuration.toFixed(1)} ms`,
   );
 } finally {
   await worker.terminate();

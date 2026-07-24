@@ -1,15 +1,21 @@
 <script setup lang="ts">
 import { BrainCircuit, Pause, Play, RefreshCcw, Save, SlidersHorizontal, Square, TrendingUp } from "@lucide/vue";
+import { computed, ref, watch } from "vue";
+import { architectureLayerSizes } from "../lib/convolution";
 import type {
+  ConvolutionConfig,
   HiddenLayer,
   TrainingMode,
+  TrainingProfiles,
   TrainingProgress,
   TrainingSettings,
 } from "../types";
 
 const props = defineProps<{
   layers: HiddenLayer[];
-  settings: TrainingSettings;
+  convolutions: ConvolutionConfig[];
+  backend: "Wasm SIMD" | "Wasm" | "JavaScript";
+  profiles: TrainingProfiles;
   progress: TrainingProgress;
   customTrainingCount: number;
   customTestCount: number;
@@ -21,18 +27,29 @@ const props = defineProps<{
 }>();
 
 const emit = defineEmits<{
-  update: [settings: TrainingSettings];
+  update: [mode: TrainingMode, settings: TrainingSettings];
   train: [];
   fineTune: [];
-  configureOptimizer: [];
+  configureOptimizer: [mode: TrainingMode];
   pause: [];
   resume: [];
   saveSnapshot: [];
   cancel: [];
 }>();
 
+const editingMode = ref<TrainingMode>("scratch");
+const settings = computed<TrainingSettings>(() => ({
+  ...props.profiles[editingMode.value],
+  mathMode: props.profiles.mathMode,
+  optimizer: { ...props.profiles[editingMode.value].optimizer },
+}));
+
 function setSetting(key: "epochs" | "learningRate", value: number) {
-  emit("update", { ...props.settings, [key]: value });
+  emit("update", editingMode.value, { ...settings.value, [key]: value });
+}
+
+function setMathMode(mathMode: "fast" | "full") {
+  emit("update", editingMode.value, { ...settings.value, mathMode });
 }
 
 function setEpochs(value: string) {
@@ -49,7 +66,13 @@ function setLearningRate(input: HTMLInputElement) {
 
 function normalizeLearningRate(input: HTMLInputElement) {
   const parsed = Number(input.value);
-  if (!Number.isFinite(parsed) || parsed <= 0) input.value = String(props.settings.learningRate);
+  if (!Number.isFinite(parsed) || parsed <= 0) input.value = String(settings.value.learningRate);
+}
+
+function start(mode: TrainingMode) {
+  editingMode.value = mode;
+  if (mode === "finetune") emit("fineTune");
+  else emit("train");
 }
 
 const optimizerLabels = {
@@ -59,6 +82,15 @@ const optimizerLabels = {
   rmsprop: "RMSProp",
   adagrad: "AdaGrad",
 };
+
+const trainingLayerSizes = computed(() => architectureLayerSizes(props.layers, props.convolutions));
+
+watch(
+  () => props.canFineTune,
+  (canFineTune) => {
+    if (!canFineTune) editingMode.value = "scratch";
+  },
+);
 
 function progressLabel() {
   if (props.progress.phase === "loading") {
@@ -85,15 +117,69 @@ function progressLabel() {
       </div>
       <span class="training-runtime">
         <BrainCircuit :size="14" />
-        Zig/Wasm Worker
+        {{ backend === "Wasm SIMD" ? "Zig/Wasm SIMD" : "Zig/Wasm" }} · {{ settings.mathMode === "full" ? "完整" : "快速" }}
       </span>
     </div>
 
     <div class="training-architecture" aria-label="训练网络结构">
-      <span v-for="(size, index) in [784, ...layers.map((layer) => layer.units), 10]" :key="`${index}-${size}`">
+      <span
+        v-for="(size, index) in trainingLayerSizes"
+        :key="`${index}-${size}`"
+      >
         <b>{{ size }}</b>
-        <i v-if="index < layers.length + 1">→</i>
+        <i v-if="index < trainingLayerSizes.length - 1">→</i>
       </span>
+    </div>
+
+    <div v-if="canFineTune" class="training-profile-toggle" role="group" aria-label="训练配置">
+      <button
+        type="button"
+        :class="{ active: editingMode === 'scratch' }"
+        :aria-pressed="editingMode === 'scratch'"
+        :disabled="progress.phase === 'loading' || progress.phase === 'training' || progress.phase === 'paused'"
+        data-testid="training-profile-scratch"
+        @click="editingMode = 'scratch'"
+      >
+        <span>重头训练</span>
+        <b>{{ profiles.scratch.epochs }} 轮 · {{ profiles.scratch.optimizer.kind.toUpperCase() }}</b>
+      </button>
+      <button
+        type="button"
+        :class="{ active: editingMode === 'finetune' }"
+        :aria-pressed="editingMode === 'finetune'"
+        :disabled="progress.phase === 'loading' || progress.phase === 'training' || progress.phase === 'paused'"
+        data-testid="training-profile-finetune"
+        @click="editingMode = 'finetune'"
+      >
+        <span>微调训练</span>
+        <b>{{ profiles.finetune.epochs }} 轮 · {{ profiles.finetune.optimizer.kind.toUpperCase() }}</b>
+      </button>
+    </div>
+
+    <div class="math-mode-setting">
+      <span>数学实现</span>
+      <div class="math-mode-toggle" role="group" aria-label="Zig 数学实现">
+        <button
+          type="button"
+          title="使用近似数学函数以提高速度"
+          :class="{ active: settings.mathMode === 'fast' }"
+          :aria-pressed="settings.mathMode === 'fast'"
+          :disabled="progress.phase === 'loading' || progress.phase === 'training' || progress.phase === 'paused'"
+          @click="setMathMode('fast')"
+        >
+          快速
+        </button>
+        <button
+          type="button"
+          title="使用标准精度数学函数"
+          :class="{ active: settings.mathMode === 'full' }"
+          :aria-pressed="settings.mathMode === 'full'"
+          :disabled="progress.phase === 'loading' || progress.phase === 'training' || progress.phase === 'paused'"
+          @click="setMathMode('full')"
+        >
+          完整
+        </button>
+      </div>
     </div>
 
     <div v-if="canFineTune" class="fine-tune-source">
@@ -103,7 +189,7 @@ function progressLabel() {
 
     <div class="training-settings">
       <label class="epoch-setting">
-        <span>{{ canFineTune ? '本次追加轮数' : '训练轮数' }}</span>
+        <span>{{ editingMode === 'finetune' ? '微调轮数' : '重训轮数' }}</span>
         <input
           class="epoch-input"
           type="number"
@@ -132,10 +218,10 @@ function progressLabel() {
       </label>
     </div>
 
-    <button class="optimizer-config-link" type="button" @click="emit('configureOptimizer')">
+    <button class="optimizer-config-link" type="button" @click="emit('configureOptimizer', editingMode)">
       <span>
         <SlidersHorizontal :size="14" />
-        优化器
+        {{ editingMode === 'finetune' ? '微调优化器' : '重训优化器' }}
       </span>
       <b>{{ optimizerLabels[settings.optimizer.kind] }}</b>
     </button>
@@ -182,11 +268,11 @@ function progressLabel() {
         type="button"
         data-testid="train-model"
         :disabled="!mnistEnabled && customTrainingCount === 0"
-        @click="emit('train')"
+        @click="start('scratch')"
       >
         <RefreshCcw v-if="canFineTune" :size="15" />
         <Play v-else :size="16" />
-        {{ canFineTune ? '从头重新训练' : '开始重新训练' }}
+        {{ canFineTune ? `从头重新训练 · ${profiles.scratch.epochs} 轮` : '开始重新训练' }}
       </button>
       <button
         v-if="canFineTune"
@@ -194,10 +280,10 @@ function progressLabel() {
         type="button"
         data-testid="fine-tune-model"
         :disabled="!mnistEnabled && customTrainingCount === 0"
-        @click="emit('fineTune')"
+        @click="start('finetune')"
       >
         <TrendingUp :size="16" />
-        <span>追加微调 <b>+{{ settings.epochs.toLocaleString() }} 轮</b></span>
+        <span>追加微调 <b>+{{ profiles.finetune.epochs.toLocaleString() }} 轮</b></span>
       </button>
     </div>
     <div v-else class="training-actions">

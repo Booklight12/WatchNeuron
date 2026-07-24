@@ -2,7 +2,8 @@
 import { ChevronLeft, ChevronRight, X } from "@lucide/vue";
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { activationLabels } from "../lib/model";
-import type { HiddenLayer, NeuralModel, PropagationDirection } from "../types";
+import { convolutionPipeline, modelConvolutions } from "../lib/convolution";
+import type { ConvolutionConfig, HiddenLayer, NeuralModel, PropagationDirection } from "../types";
 
 interface VisibleNode {
   layerIndex: number;
@@ -21,6 +22,7 @@ interface InspectedNode {
 
 const props = defineProps<{
   layers: HiddenLayer[];
+  convolutions: ConvolutionConfig[];
   activations: number[][];
   gradients: number[][];
   model: NeuralModel | null;
@@ -37,7 +39,28 @@ const canvas = ref<HTMLCanvasElement | null>(null);
 const popover = ref<HTMLElement | null>(null);
 const nodeTargets = ref<VisibleNode[]>([]);
 const inspectedNode = ref<InspectedNode | null>(null);
-const layerSizes = computed(() => [784, ...props.layers.map((layer) => layer.units), 10]);
+const convolutionEntries = computed(() => convolutionPipeline(props.layers, props.convolutions));
+const visualLayers = computed(() => {
+  const result: Array<
+    | { kind: "input"; size: number }
+    | { kind: "conv"; size: number; convolutionIndex: number }
+    | { kind: "dense"; size: number; denseIndex: number }
+    | { kind: "output"; size: number; denseIndex: number }
+  > = [{ kind: "input", size: 784 }];
+  for (let position = 0; position <= props.layers.length; position++) {
+    convolutionEntries.value.forEach((entry, convolutionIndex) => {
+      if (entry.config.position === position) {
+        result.push({ kind: "conv", size: entry.output.length, convolutionIndex });
+      }
+    });
+    if (position < props.layers.length) {
+      result.push({ kind: "dense", size: props.layers[position].units, denseIndex: position });
+    }
+  }
+  result.push({ kind: "output", size: 10, denseIndex: props.layers.length });
+  return result;
+});
+const layerSizes = computed(() => visualLayers.value.map(({ size }) => size));
 let resizeObserver: ResizeObserver | null = null;
 let frame = 0;
 let lastTime = 0;
@@ -110,17 +133,59 @@ const neuronDetails = computed(() => {
     };
   }
 
-  const denseLayer = props.model?.layers[selected.layerIndex - 1];
-  const isOutput = selected.layerIndex === layerSizes.value.length - 1;
+  const layerMetadata = visualLayers.value[selected.layerIndex];
+  if (layerMetadata?.kind === "conv") {
+    const entry = convolutionEntries.value[layerMetadata.convolutionIndex];
+    const config = entry.config;
+    const shape = entry.output;
+    const mapSize = shape.width * shape.height;
+    const filter = Math.floor(selected.neuronIndex / mapSize);
+    const position = selected.neuronIndex % mapSize;
+    const row = Math.floor(position / shape.width);
+    const column = position % shape.width;
+    const layer = modelConvolutions(props.model)[layerMetadata.convolutionIndex];
+    const kernelLength = config.kernelSize ** 2;
+    const kernelOffset = filter * (layer?.inputChannels ?? 1) * kernelLength;
+    const kernel = layer?.weights.subarray(kernelOffset, kernelOffset + kernelLength) ?? [];
+    const absoluteMean = kernel.length
+      ? Array.from(kernel).reduce((sum, weight) => sum + Math.abs(weight), 0) / kernel.length
+      : 0;
+    return {
+      eyebrow: props.training ? "CONV2D TRAINING TRACE" : "CONV2D FEATURE",
+      title: `特征图 ${filter + 1} · 激活 #${position}`,
+      badge: `${activationLabels[config.activation]} · ${config.kernelSize}×${config.kernelSize}`,
+      details: [
+        { label: "当前激活", value: formatNumber(value) },
+        { label: "特征坐标", value: `行 ${row + 1} · 列 ${column + 1}` },
+        ...(props.training
+          ? [
+              { label: "反向梯度", value: formatNumber(gradient) },
+              { label: "梯度绝对值", value: formatNumber(Math.abs(gradient)) },
+            ]
+          : [
+              { label: "卷积偏置", value: formatNumber(layer?.biases[filter] ?? 0) },
+              { label: "核权重绝对均值", value: formatNumber(absoluteMean) },
+              { label: "步幅 / 填充", value: `${config.stride} / ${config.padding}` },
+            ]),
+      ],
+      note,
+    };
+  }
+
+  const denseIndex = layerMetadata?.kind === "dense" || layerMetadata?.kind === "output"
+    ? layerMetadata.denseIndex
+    : -1;
+  const denseLayer = props.model?.layers[denseIndex];
+  const isOutput = layerMetadata?.kind === "output";
   const activation = isOutput
     ? "Softmax"
-    : activationLabels[props.layers[selected.layerIndex - 1]?.activation ?? "relu"];
+    : activationLabels[props.layers[denseIndex]?.activation ?? "relu"];
   if (props.training) {
     return {
-      eyebrow: isOutput ? "OUTPUT TRAINING TRACE" : `DENSE ${selected.layerIndex} TRAINING TRACE`,
+      eyebrow: isOutput ? "OUTPUT TRAINING TRACE" : `DENSE ${denseIndex + 1} TRAINING TRACE`,
       title: isOutput
         ? `数字 ${selected.neuronIndex} 输出神经元`
-        : `隐藏层 ${selected.layerIndex} · 神经元 #${selected.neuronIndex}`,
+        : `隐藏层 ${denseIndex + 1} · 神经元 #${selected.neuronIndex}`,
       badge: `${activation} · 训练快照`,
       details: [
         {
@@ -139,10 +204,10 @@ const neuronDetails = computed(() => {
   }
   if (!denseLayer || selected.neuronIndex >= denseLayer.outputSize) {
     return {
-      eyebrow: isOutput ? "OUTPUT NEURON" : `DENSE ${selected.layerIndex}`,
+      eyebrow: isOutput ? "OUTPUT NEURON" : `DENSE ${denseIndex + 1}`,
       title: isOutput
         ? `数字 ${selected.neuronIndex} 输出神经元`
-        : `隐藏层 ${selected.layerIndex} · 神经元 #${selected.neuronIndex}`,
+        : `隐藏层 ${denseIndex + 1} · 神经元 #${selected.neuronIndex}`,
       badge: activation,
       details: [{ label: "当前激活", value: formatNumber(value) }],
       note: sampleNote,
@@ -165,10 +230,10 @@ const neuronDetails = computed(() => {
   }
 
   return {
-    eyebrow: isOutput ? "OUTPUT NEURON" : `DENSE ${selected.layerIndex}`,
+    eyebrow: isOutput ? "OUTPUT NEURON" : `DENSE ${denseIndex + 1}`,
     title: isOutput
       ? `数字 ${selected.neuronIndex} 输出神经元`
-      : `隐藏层 ${selected.layerIndex} · 神经元 #${selected.neuronIndex}`,
+      : `隐藏层 ${denseIndex + 1} · 神经元 #${selected.neuronIndex}`,
     badge: activation,
     details: [
       {
@@ -188,10 +253,15 @@ const neuronDetails = computed(() => {
 
 function nodeLabel(target: VisibleNode) {
   if (target.layerIndex === 0) return `输入神经元 ${target.neuronIndex}，点击查看参数`;
-  if (target.layerIndex === layerSizes.value.length - 1) {
+  const metadata = visualLayers.value[target.layerIndex];
+  if (metadata?.kind === "conv") {
+    return `卷积激活 ${target.neuronIndex}，点击查看卷积参数`;
+  }
+  if (metadata?.kind === "output") {
     return `数字 ${target.neuronIndex} 输出神经元，点击查看参数`;
   }
-  return `隐藏层 ${target.layerIndex} 神经元 ${target.neuronIndex}，点击查看参数`;
+  const denseIndex = metadata?.kind === "dense" ? metadata.denseIndex + 1 : target.layerIndex;
+  return `隐藏层 ${denseIndex} 神经元 ${target.neuronIndex}，点击查看参数`;
 }
 
 function popoverPosition(target: VisibleNode) {
@@ -435,12 +505,14 @@ function draw(time = performance.now()) {
         ? "#b8b5ad"
         : "#56544e";
     ctx.font = "600 11px 'Segoe UI', sans-serif";
-    const label =
-      layerIndex === 0
-        ? "INPUT"
-        : layerIndex === positions.length - 1
-          ? "OUTPUT"
-          : `DENSE ${layerIndex}`;
+    const metadata = visualLayers.value[layerIndex];
+    const label = metadata?.kind === "input"
+      ? "INPUT"
+      : metadata?.kind === "output"
+        ? "OUTPUT"
+        : metadata?.kind === "conv"
+          ? "CONV2D"
+          : `DENSE ${(metadata?.kind === "dense" ? metadata.denseIndex : layerIndex) + 1}`;
     ctx.fillText(label, columns[layerIndex], 20);
     ctx.fillStyle = "#7f7c75";
     ctx.font = "11px ui-monospace, monospace";

@@ -2,13 +2,28 @@ import { readFile } from "node:fs/promises";
 
 const model = JSON.parse(await readFile("public/model.json", "utf8"));
 const wasmBytes = await readFile("public/neuron_kernel.wasm");
+const simdWasmBytes = await readFile("public/neuron_kernel_simd.wasm");
 const { instance } = await WebAssembly.instantiate(wasmBytes, {});
+const { instance: simdInstance } = await WebAssembly.instantiate(simdWasmBytes, {});
 const { memory, matvec, activate, __heap_base: heapBase } = instance.exports;
 if (
   typeof instance.exports.forward_sparse !== "function" ||
-  typeof instance.exports.train_sample !== "function"
+  typeof instance.exports.forward_dense_block !== "function" ||
+  typeof instance.exports.forward_dense_training !== "function" ||
+  typeof instance.exports.train_sample !== "function" ||
+  typeof instance.exports.train_dense_from_gradient !== "function" ||
+  typeof instance.exports.conv2d_forward !== "function" ||
+  typeof instance.exports.conv2d_train !== "function" ||
+  typeof instance.exports.simd_enabled !== "function" ||
+  typeof instance.exports.set_math_mode !== "function" ||
+  typeof instance.exports.math_mode !== "function" ||
+  typeof simdInstance.exports.simd_enabled !== "function" ||
+  typeof simdInstance.exports.set_math_mode !== "function" ||
+  typeof simdInstance.exports.math_mode !== "function" ||
+  instance.exports.simd_enabled() !== 0 ||
+  simdInstance.exports.simd_enabled() !== 1
 ) {
-  throw new Error("Zig/Wasm training exports are missing");
+  throw new Error("Zig/Wasm scalar or SIMD exports are missing");
 }
 const align = (value) => (value + 15) & ~15;
 
@@ -64,7 +79,69 @@ if (
   throw new Error("Wasm Softmax activation failed its normalization probe");
 }
 console.log(`Wasm activation test: ${scalarActivationProbes.length + 1}/16 functions passed`);
-console.log("Zig/Wasm training exports: forward_sparse + train_sample");
+
+activationProbe.set([-3.25, 0.37, 2.75]);
+instance.exports.set_math_mode(0);
+activate(activationProbePtr, activationProbe.length, 3);
+const fastSigmoid = Array.from(activationProbe);
+activationProbe.set([-3.25, 0.37, 2.75]);
+instance.exports.set_math_mode(1);
+activate(activationProbePtr, activationProbe.length, 3);
+const fullSigmoid = Array.from(activationProbe);
+const expectedSigmoid = [-3.25, 0.37, 2.75].map((value) => 1 / (1 + Math.exp(-value)));
+if (
+  instance.exports.math_mode() !== 1 ||
+  !fullSigmoid.every((value, index) => Math.abs(value - expectedSigmoid[index]) < 1e-6) ||
+  !fullSigmoid.some((value, index) => Math.abs(value - fastSigmoid[index]) > 1e-5)
+) {
+  throw new Error("Wasm full-precision sigmoid mode did not use the standard implementation");
+}
+activationProbe.set([-2.4, 0.45, 3.1]);
+activate(activationProbePtr, activationProbe.length, 4);
+if (!Array.from(activationProbe).every((value, index) =>
+  Math.abs(value - Math.tanh([-2.4, 0.45, 3.1][index])) < 1e-6
+)) {
+  throw new Error("Wasm full-precision tanh mode did not use the standard implementation");
+}
+simdInstance.exports.set_math_mode(1);
+if (simdInstance.exports.math_mode() !== 1) {
+  throw new Error("Wasm SIMD full-precision mode could not be selected");
+}
+instance.exports.set_math_mode(0);
+simdInstance.exports.set_math_mode(0);
+console.log("Wasm math modes: fast approximation and full precision passed");
+console.log("Zig/Wasm training exports: segmented Dense forward/backprop + train_sample + Conv2D forward/backprop");
+
+const convInputPtr = align(activationProbePtr + 64);
+const convWeightsPtr = align(convInputPtr + 25 * 4);
+const convBiasPtr = align(convWeightsPtr + 9 * 4);
+const convOutputPtr = align(convBiasPtr + 4);
+const convPreactivationPtr = align(convOutputPtr + 25 * 4);
+const wasmFloats = new Float32Array(memory.buffer);
+wasmFloats.fill(0, convInputPtr / 4, convInputPtr / 4 + 25);
+wasmFloats[convInputPtr / 4 + 12] = 1;
+wasmFloats.set([0, 0, 0, 0, 1, 0, 0, 0, 0], convWeightsPtr / 4);
+wasmFloats[convBiasPtr / 4] = 0;
+instance.exports.conv2d_forward(
+  convInputPtr,
+  convWeightsPtr,
+  convBiasPtr,
+  convOutputPtr,
+  convPreactivationPtr,
+  5,
+  5,
+  1,
+  1,
+  3,
+  1,
+  1,
+  0,
+);
+const convOutput = Array.from(wasmFloats.subarray(convOutputPtr / 4, convOutputPtr / 4 + 25));
+if (Math.abs(convOutput[12] - 1) > 1e-6 || convOutput.some((value, index) => index !== 12 && Math.abs(value) > 1e-6)) {
+  throw new Error("Wasm Conv2D identity forward probe failed");
+}
+console.log("Wasm Conv2D forward probe: 5x5 identity kernel passed");
 
 function infer(input) {
   const floats = new Float32Array(memory.buffer);
@@ -108,3 +185,60 @@ for (let digit = 0; digit < 10; digit++) {
 
 if (correct < 8) throw new Error(`Wasm smoke test recognized only ${correct}/10 bundled samples`);
 console.log(`Wasm smoke test: ${correct}/10 bundled samples recognized`);
+
+function benchmarkMatvec(wasmInstance) {
+  const inputSize = 784;
+  const outputSize = 128;
+  const exports = wasmInstance.exports;
+  let cursor = align(Number(exports.__heap_base.value));
+  const inputPtr = cursor;
+  cursor = align(cursor + inputSize * 4);
+  const weightsPtr = cursor;
+  cursor = align(cursor + inputSize * outputSize * 4);
+  const biasesPtr = cursor;
+  cursor = align(cursor + outputSize * 4);
+  const outputPtr = cursor;
+  cursor += outputSize * 4;
+  if (cursor > exports.memory.buffer.byteLength) {
+    exports.memory.grow(Math.ceil((cursor - exports.memory.buffer.byteLength) / 65536));
+  }
+  const floats = new Float32Array(exports.memory.buffer);
+  const input = Float32Array.from({ length: inputSize }, (_, index) => ((index * 17) % 101 - 50) / 50);
+  const weights = Float32Array.from(
+    { length: inputSize * outputSize },
+    (_, index) => ((index * 29) % 127 - 63) / 200,
+  );
+  const biases = Float32Array.from({ length: outputSize }, (_, index) => (index - 64) / 100);
+  floats.set(input, inputPtr / 4);
+  floats.set(weights, weightsPtr / 4);
+  floats.set(biases, biasesPtr / 4);
+  for (let index = 0; index < 100; index++) {
+    exports.matvec(inputPtr, weightsPtr, biasesPtr, outputPtr, inputSize, outputSize);
+  }
+  const timings = [];
+  for (let round = 0; round < 5; round++) {
+    const startedAt = performance.now();
+    for (let index = 0; index < 500; index++) {
+      exports.matvec(inputPtr, weightsPtr, biasesPtr, outputPtr, inputSize, outputSize);
+    }
+    timings.push(performance.now() - startedAt);
+  }
+  timings.sort((left, right) => left - right);
+  return {
+    output: Array.from(floats.subarray(outputPtr / 4, outputPtr / 4 + outputSize)),
+    elapsedMs: timings[2],
+  };
+}
+
+const scalarBenchmark = benchmarkMatvec(instance);
+const simdBenchmark = benchmarkMatvec(simdInstance);
+const maximumDifference = scalarBenchmark.output.reduce(
+  (maximum, value, index) => Math.max(maximum, Math.abs(value - simdBenchmark.output[index])),
+  0,
+);
+if (maximumDifference > 0.001) {
+  throw new Error(`SIMD matvec diverged from scalar output by ${maximumDifference}`);
+}
+console.log(
+  `Wasm SIMD matvec parity passed; median ${scalarBenchmark.elapsedMs.toFixed(1)} ms scalar vs ${simdBenchmark.elapsedMs.toFixed(1)} ms SIMD (${(scalarBenchmark.elapsedMs / simdBenchmark.elapsedMs).toFixed(2)}x)`,
+);

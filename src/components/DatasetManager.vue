@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
 import { ArrowLeft, Database, HardDrive, LockKeyhole, PencilLine, Trash2 } from "@lucide/vue";
+import AppSelect, { type AppSelectOption, type AppSelectValue } from "./AppSelect.vue";
 import SampleThumbnail from "./SampleThumbnail.vue";
 import type { CustomDatasetSample, DatasetSplit } from "../types";
 
@@ -21,8 +22,16 @@ const emit = defineEmits<{
 type SplitFilter = "all" | DatasetSplit;
 
 const splitFilter = ref<SplitFilter>("all");
-const labelFilter = ref("all");
+const labelFilter = ref<AppSelectValue>("all");
 const selectedIds = ref<Set<string>>(new Set());
+const digitOptions: AppSelectOption[] = Array.from({ length: 10 }, (_, digit) => ({
+  value: digit,
+  label: String(digit),
+}));
+const labelFilterOptions: AppSelectOption[] = [
+  { value: "all", label: "全部" },
+  ...digitOptions,
+];
 
 const trainingCount = computed(
   () => props.samples.filter((sample) => sample.split === "training").length,
@@ -179,10 +188,12 @@ watch(
 
       <label class="sample-label-filter">
         <span>标签</span>
-        <select v-model="labelFilter" aria-label="按数字标签筛选">
-          <option value="all">全部</option>
-          <option v-for="digit in 10" :key="digit - 1" :value="String(digit - 1)">{{ digit - 1 }}</option>
-        </select>
+        <AppSelect
+          v-model="labelFilter"
+          :options="labelFilterOptions"
+          label="按数字标签筛选"
+          mono
+        />
       </label>
 
       <label class="select-visible-control" :class="{ disabled: visibleIds.length === 0 }">
@@ -247,13 +258,14 @@ watch(
 
           <label class="sample-card-label-field">
             <span>数字标签</span>
-            <select
-              :value="sample.label"
+            <AppSelect
+              :model-value="sample.label"
+              :options="digitOptions"
+              :label="`修改样本 ${shortId(sample)} 的数字标签`"
               :disabled="locked"
-              @change="emit('update', sample.id, { label: Number(($event.target as HTMLSelectElement).value) })"
-            >
-              <option v-for="digit in 10" :key="digit - 1" :value="digit - 1">{{ digit - 1 }}</option>
-            </select>
+              mono
+              @update:model-value="emit('update', sample.id, { label: Number($event) })"
+            />
           </label>
 
           <div class="sample-card-split" role="group" aria-label="样本所属数据集">
