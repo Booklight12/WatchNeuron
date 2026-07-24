@@ -133,8 +133,20 @@ export class WebGpuBatchExecutor {
   static async create() {
     const gpu = (globalThis.navigator as Navigator & { gpu?: any }).gpu;
     if (!gpu) throw new Error("当前浏览器或 Worker 不支持 WebGPU");
-    const adapter = await gpu.requestAdapter({ powerPreference: "high-performance" });
+    const adapter = await gpu.requestAdapter({
+      powerPreference: "high-performance",
+      forceFallbackAdapter: false,
+    });
     if (!adapter) throw new Error("无法获取 WebGPU 适配器");
+    const adapterInfo = adapter.info ?? {};
+    const isFallbackAdapter = Boolean(
+      adapterInfo.isFallbackAdapter ?? adapter.isFallbackAdapter,
+    );
+    if (isFallbackAdapter) {
+      throw new Error(
+        "浏览器只提供了 WebGPU 软件回退适配器；请启用硬件加速并为浏览器指定高性能显卡",
+      );
+    }
     const device = await adapter.requestDevice();
     const bindGroupLayout = device.createBindGroupLayout({
       label: "WatchNeuron tensor buffers",
@@ -169,10 +181,14 @@ export class WebGpuBatchExecutor {
     if (errors.length > 0) {
       throw new Error(`WGSL 编译失败：${errors.map((message: any) => message.message).join("；")}`);
     }
-    const adapterInfo = adapter.info;
-    const adapterName = String(
-      adapterInfo?.description || adapterInfo?.device || adapterInfo?.architecture || "GPU",
+    const primaryName = String(
+      adapterInfo.description || adapterInfo.device || adapterInfo.architecture || "GPU",
     );
+    const adapterDetails = [
+      adapterInfo.type,
+      adapterInfo.backend,
+    ].filter((value) => typeof value === "string" && value.length > 0);
+    const adapterName = [primaryName, ...adapterDetails].join(" · ");
     return new WebGpuBatchExecutor(device, shader, pipelineLayout, adapterName);
   }
 

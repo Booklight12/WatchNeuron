@@ -146,7 +146,7 @@ function progressLabel() {
       </div>
       <span class="training-runtime">
         <BrainCircuit :size="14" />
-        {{ settings.computeBackend === "webgpu" ? "Zig/WebGPU" : backend === "Wasm SIMD" ? "Zig/Wasm SIMD" : "Zig/Wasm" }} · {{ settings.mathMode === "full" ? "完整" : "快速" }}
+        {{ settings.computeBackend === "webgpu" ? `Zig/WebGPU${progress.adapter ? ` · ${progress.adapter}` : ""}` : backend === "Wasm SIMD" ? "Zig/Wasm SIMD" : "Zig/Wasm" }} · {{ settings.mathMode === "full" ? "完整" : "快速" }}
       </span>
     </div>
 

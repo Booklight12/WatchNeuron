@@ -180,6 +180,7 @@ export interface TrainingProgress {
   loss: number;
   elapsedMs: number;
   message?: string;
+  adapter?: string;
 }
 
 export interface TrainingTrace {

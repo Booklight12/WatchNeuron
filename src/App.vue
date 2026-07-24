@@ -442,6 +442,12 @@ const trainingProgress = ref<TrainingProgress>({
   loss: 0,
   elapsedMs: 0,
 });
+const selectedComputeBackendLabel = computed(() => {
+  if (trainingProfiles.value.computeBackend === "webgpu") {
+    return `WebGPU${trainingProgress.value.adapter ? ` · ${trainingProgress.value.adapter}` : ""}`;
+  }
+  return engineBackend.value;
+});
 const trainingTrace = shallowRef<TrainingTrace | null>(null);
 let trainingWorker: Worker | null = null;
 let modelSaveOperation = 0;
@@ -1328,7 +1334,7 @@ onBeforeUnmount(() => {
         <div class="runtime-status">
           <span class="status-item">
             <Cpu :size="15" />
-            {{ engineBackend }} · {{ trainingProfiles.mathMode === "full" ? "完整" : "快速" }}
+            {{ selectedComputeBackendLabel }} · {{ trainingProfiles.mathMode === "full" ? "完整" : "快速" }}
             <i class="status-dot" />
           </span>
           <span class="status-item latency-item">
@@ -1577,7 +1583,7 @@ onBeforeUnmount(() => {
 
     <footer class="statusbar">
       <span><i class="status-dot" /> {{ activeView === "lab" ? "引擎就绪" : activeView === "signals" ? (trainingFlowActive ? "训练信号已接入" : "推理信号已接入") : activeView === "samples" ? `${customSamples.length} 个自定义样本` : activeView === "models" ? `${savedModels.length} 个本地模型` : `重训 ${trainingProfiles.scratch.optimizer.kind.toUpperCase()} · 微调 ${trainingProfiles.finetune.optimizer.kind.toUpperCase()}` }}</span>
-      <span>{{ activeView === "lab" ? `FP32 · ${engineBackend} · ${trainingProfiles.mathMode === "full" ? "完整" : "快速"}` : activeView === "signals" ? `${layerSizes.length} 层 · FP32` : activeView === "samples" ? `训练 ${customTrainingCount} · 测试 ${customTestCount}` : activeView === "models" ? "FP32 · IndexedDB" : `学习率 ${trainingProfiles.scratch.learningRate} / ${trainingProfiles.finetune.learningRate}` }}</span>
+      <span>{{ activeView === "lab" ? `FP32 · ${selectedComputeBackendLabel} · ${trainingProfiles.mathMode === "full" ? "完整" : "快速"}` : activeView === "signals" ? `${layerSizes.length} 层 · FP32` : activeView === "samples" ? `训练 ${customTrainingCount} · 测试 ${customTestCount}` : activeView === "models" ? "FP32 · IndexedDB" : `学习率 ${trainingProfiles.scratch.learningRate} / ${trainingProfiles.finetune.learningRate}` }}</span>
       <span>{{ activeView === "lab" ? "本地推理 · 本地训练" : activeView === "signals" ? (trainingProgress.phase === "paused" ? "训练已暂停" : "实时逐层采样") : activeView === "samples" ? (mnistEnabled ? "MNIST 已启用" : "仅自定义样本") : activeView === "models" ? "训练完成自动保存" : "5 种 Zig/Wasm 优化器" }}</span>
     </footer>
   </div>

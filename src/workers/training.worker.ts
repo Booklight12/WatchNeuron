@@ -1953,6 +1953,14 @@ async function train(message: TrainMessage) {
       runtime.batch.capacity,
       runtime.outputHead === "sigmoid",
     );
+    postMessage({
+      type: "progress",
+      phase: "loading",
+      epoch: 0,
+      epochs,
+      adapter: webgpu.adapterName,
+      backend: "Zig/WebGPU",
+    });
   }
   activeRuntime = runtime;
   if (!Number.isFinite(message.settings.learningRate) || message.settings.learningRate <= 0) {

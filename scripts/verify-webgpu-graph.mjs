@@ -72,7 +72,7 @@ Object.defineProperty(globalThis.navigator, "gpu", {
   configurable: true,
   value: {
     requestAdapter: async () => ({
-      info: { description: "mock-gpu" },
+      info: { description: "mock-gpu", isFallbackAdapter: false },
       requestDevice: async () => device,
     }),
   },
