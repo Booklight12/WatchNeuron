@@ -381,7 +381,7 @@ const completed = new Promise((resolvePromise, rejectPromise) => {
         epochs: 1,
         learningRate: 0.003,
         batchSize: 4,
-        mathMode: "fast",
+        mathMode: "full",
         optimizer: { ...optimizerConfig("adam"), weightDecay: 0.02 },
       },
       initialModel,
@@ -515,7 +515,7 @@ const completed = new Promise((resolvePromise, rejectPromise) => {
         !Number.isFinite(message.accuracy) ||
         message.trainingSamples !== trainingSampleCount ||
         message.testSamples !== testSampleCount ||
-        message.backend !== (verificationStage === "convolution-middle"
+        message.backend !== (verificationStage === "convolution-middle" || verificationStage.startsWith("spatial-head")
           ? "Zig/Wasm SIMD · 完整"
           : "Zig/Wasm SIMD · 快速") ||
         (verificationStage === "activations" &&

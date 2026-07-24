@@ -14,8 +14,15 @@ if (
   typeof instance.exports.train_dense_from_gradient !== "function" ||
   typeof instance.exports.conv2d_forward !== "function" ||
   typeof instance.exports.conv2d_train !== "function" ||
+  typeof instance.exports.conv2d_forward_batch !== "function" ||
+  typeof instance.exports.conv2d_train_batch !== "function" ||
   typeof instance.exports.pool2d_forward !== "function" ||
   typeof instance.exports.pool2d_backward !== "function" ||
+  typeof instance.exports.pool2d_forward_batch !== "function" ||
+  typeof instance.exports.pool2d_backward_batch !== "function" ||
+  typeof instance.exports.dense_forward_batch !== "function" ||
+  typeof instance.exports.dense_backward_batch !== "function" ||
+  typeof instance.exports.output_loss_batch !== "function" ||
   typeof instance.exports.apply_optimizer !== "function" ||
   typeof instance.exports.simd_enabled !== "function" ||
   typeof instance.exports.set_math_mode !== "function" ||
@@ -390,7 +397,145 @@ instance.exports.pool2d_backward(
 assertArrayClose([poolInputGradient[0]], [1], "Wasm oversized MaxPool2D backward probe");
 console.log("Wasm Pool2D probes: MaxPool2D, AvgPool2D, GAP, and oversized windows passed");
 
-const optimizerParametersPtr = align(poolInputGradientPtr + 16 * 4);
+let batchProbeCursor = align(poolInputGradientPtr + 16 * 4);
+const allocateBatchProbe = (bytes, alignment = 16) => {
+  batchProbeCursor = Math.ceil(batchProbeCursor / alignment) * alignment;
+  const pointer = batchProbeCursor;
+  batchProbeCursor += bytes;
+  return pointer;
+};
+const batchInputPtr = allocateBatchProbe(2 * 16 * 4);
+const batchConvWeightsPtr = allocateBatchProbe(4);
+const batchConvBiasPtr = allocateBatchProbe(4);
+const batchConvOutputPtr = allocateBatchProbe(2 * 16 * 4);
+const batchConvPreactivationPtr = allocateBatchProbe(2 * 16 * 4);
+const batchPoolOutputPtr = allocateBatchProbe(2 * 4 * 4);
+const batchPoolIndicesPtr = allocateBatchProbe(2 * 4 * 4, 4);
+const batchDenseWeightsPtr = allocateBatchProbe(2 * 4 * 4);
+const batchDenseBiasPtr = allocateBatchProbe(2 * 4);
+const batchDenseOutputPtr = allocateBatchProbe(2 * 2 * 4);
+const batchDensePreactivationPtr = allocateBatchProbe(2 * 2 * 4);
+const batchDenseMaskPtr = allocateBatchProbe(2 * 2 * 4);
+const batchDenseDeltaPtr = allocateBatchProbe(2 * 2 * 4);
+const batchDenseInputGradientPtr = allocateBatchProbe(2 * 4 * 4);
+const batchDenseWeightGradientPtr = allocateBatchProbe(2 * 4 * 4);
+const batchDenseBiasGradientPtr = allocateBatchProbe(2 * 4);
+const batchLabelsPtr = allocateBatchProbe(2 * 4, 4);
+const batchLossesPtr = allocateBatchProbe(2 * 4);
+const batchProbeFloats = new Float32Array(memory.buffer);
+new Float32Array(memory.buffer, batchInputPtr, 32).set([
+  ...Array.from({ length: 16 }, (_, index) => index + 1),
+  ...Array.from({ length: 16 }, (_, index) => index + 101),
+]);
+new Float32Array(memory.buffer, batchConvWeightsPtr, 1)[0] = 2;
+new Float32Array(memory.buffer, batchConvBiasPtr, 1)[0] = 1;
+instance.exports.set_math_mode(1);
+instance.exports.conv2d_forward_batch(
+  batchInputPtr,
+  batchConvWeightsPtr,
+  batchConvBiasPtr,
+  batchConvOutputPtr,
+  batchConvPreactivationPtr,
+  2,
+  4,
+  4,
+  1,
+  1,
+  1,
+  1,
+  0,
+  0,
+);
+assertArrayClose(
+  Array.from(new Float32Array(memory.buffer, batchConvOutputPtr, 32)),
+  [
+    ...Array.from({ length: 16 }, (_, index) => (index + 1) * 2 + 1),
+    ...Array.from({ length: 16 }, (_, index) => (index + 101) * 2 + 1),
+  ],
+  "Wasm [B,C,H,W] Conv2D batch isolation probe",
+);
+instance.exports.pool2d_forward_batch(
+  batchConvOutputPtr,
+  batchPoolOutputPtr,
+  batchPoolIndicesPtr,
+  2,
+  4,
+  4,
+  1,
+  2,
+  2,
+  0,
+  0,
+);
+assertArrayClose(
+  Array.from(new Float32Array(memory.buffer, batchPoolOutputPtr, 8)),
+  [13, 17, 29, 33, 213, 217, 229, 233],
+  "Wasm [B,C,H,W] MaxPool2D batch isolation probe",
+);
+new Float32Array(memory.buffer, batchDenseWeightsPtr, 8).fill(0);
+new Float32Array(memory.buffer, batchDenseBiasPtr, 2).fill(0);
+new Int32Array(memory.buffer, batchLabelsPtr, 2).set([0, 1]);
+instance.exports.dense_forward_batch(
+  batchPoolOutputPtr,
+  batchDenseWeightsPtr,
+  batchDenseBiasPtr,
+  batchDenseOutputPtr,
+  batchDensePreactivationPtr,
+  batchDenseMaskPtr,
+  2,
+  4,
+  2,
+  0,
+  0,
+  1,
+  0,
+  1,
+);
+instance.exports.output_loss_batch(
+  batchDenseOutputPtr,
+  batchDenseDeltaPtr,
+  batchLabelsPtr,
+  batchLossesPtr,
+  2,
+  2,
+  0,
+);
+batchProbeFloats.fill(
+  0,
+  batchDenseWeightGradientPtr / 4,
+  batchDenseWeightGradientPtr / 4 + 10,
+);
+instance.exports.dense_backward_batch(
+  batchPoolOutputPtr,
+  batchDenseWeightsPtr,
+  batchDensePreactivationPtr,
+  batchDenseDeltaPtr,
+  batchDenseInputGradientPtr,
+  batchDenseDeltaPtr,
+  batchDenseWeightGradientPtr,
+  batchDenseBiasGradientPtr,
+  batchDenseMaskPtr,
+  2,
+  4,
+  2,
+  0,
+);
+assertArrayClose(
+  Array.from(new Float32Array(memory.buffer, batchDenseWeightGradientPtr, 8)),
+  [100, 100, 100, 100, -100, -100, -100, -100],
+  "Wasm [B,F] shared Dense batch-gradient probe",
+  1e-4,
+);
+assertArrayClose(
+  Array.from(new Float32Array(memory.buffer, batchLossesPtr, 2)),
+  [Math.log(2), Math.log(2)],
+  "Wasm batch loss probe",
+  1e-5,
+);
+instance.exports.set_math_mode(0);
+console.log("Wasm full batch path: [B,C,H,W] Conv2D/Pool2D and [B,F] Dense gradients passed");
+
+const optimizerParametersPtr = align(batchProbeCursor);
 const optimizerGradientsPtr = align(optimizerParametersPtr + 3 * 4);
 const optimizerFirstPtr = align(optimizerGradientsPtr + 3 * 4);
 const optimizerSecondPtr = align(optimizerFirstPtr + 3 * 4);

@@ -89,6 +89,10 @@ interface SampleTraceResult {
   prediction: number;
 }
 
+interface FullBatchTraceResult extends SampleTraceResult {
+  batchLoss: number;
+}
+
 interface TrainingWasmExports extends MathModeWasmExports {
   memory: WebAssembly.Memory;
   __heap_base: WebAssembly.Global;
@@ -99,8 +103,15 @@ interface TrainingWasmExports extends MathModeWasmExports {
   train_dense_from_gradient: (...args: number[]) => void;
   conv2d_forward: (...args: number[]) => void;
   conv2d_train: (...args: number[]) => void;
+  conv2d_forward_batch: (...args: number[]) => void;
+  conv2d_train_batch: (...args: number[]) => void;
   pool2d_forward: (...args: number[]) => void;
   pool2d_backward: (...args: number[]) => void;
+  pool2d_forward_batch: (...args: number[]) => void;
+  pool2d_backward_batch: (...args: number[]) => void;
+  dense_forward_batch: (...args: number[]) => void;
+  dense_backward_batch: (...args: number[]) => void;
+  output_loss_batch: (...args: number[]) => void;
   apply_optimizer: (...args: number[]) => void;
   simd_enabled: () => number;
 }
@@ -174,6 +185,71 @@ interface WasmConvolutionRuntime {
 
 type WasmSpatialRuntime = WasmConvolutionRuntime | WasmPoolingRuntime;
 
+interface WasmBatchLayerBase {
+  inputPointer: number;
+  outputPointer: number;
+  preactivationPointer: number;
+  deltaPointer: number;
+  inputGradientPointer: number;
+  dropoutMaskPointer: number;
+  inputSize: number;
+  outputSize: number;
+  input: Float32Array;
+  output: Float32Array;
+  preactivation: Float32Array;
+  delta: Float32Array;
+  inputGradient: Float32Array;
+  dropoutMask: Float32Array;
+}
+
+interface WasmBatchDenseRuntime extends WasmBatchLayerBase {
+  type: "dense";
+  layerIndex: number;
+}
+
+interface WasmBatchConvolutionRuntime extends WasmBatchLayerBase {
+  type: "conv";
+  convolutionIndex: number;
+}
+
+interface WasmBatchPoolingRuntime extends WasmBatchLayerBase {
+  type: "pool";
+  poolingIndex: number;
+  indicesPointer: number;
+}
+
+type WasmBatchLayerRuntime =
+  | WasmBatchDenseRuntime
+  | WasmBatchConvolutionRuntime
+  | WasmBatchPoolingRuntime;
+
+interface WasmBatchLayerAllocation {
+  type: "dense" | "conv" | "pool";
+  layerIndex?: number;
+  convolutionIndex?: number;
+  poolingIndex?: number;
+  indicesPointer: number;
+  inputPointer: number;
+  outputPointer: number;
+  preactivationPointer: number;
+  deltaPointer: number;
+  inputGradientPointer: number;
+  dropoutMaskPointer: number;
+  inputSize: number;
+  outputSize: number;
+}
+
+interface WasmBatchRuntime {
+  capacity: number;
+  inputPointer: number;
+  labelsPointer: number;
+  lossesPointer: number;
+  input: Float32Array;
+  labels: Int32Array;
+  losses: Float32Array;
+  layers: WasmBatchLayerRuntime[];
+}
+
 interface WasmTrainingRuntime {
   wasm: TrainingWasmExports;
   config: OptimizerConfig;
@@ -189,6 +265,7 @@ interface WasmTrainingRuntime {
   convolutions: WasmConvolutionRuntime[];
   poolings: WasmPoolingRuntime[];
   spatialLayers: WasmSpatialRuntime[];
+  batch: WasmBatchRuntime;
   outputHead: OutputHeadKind;
   backend: "Zig/Wasm SIMD · 快速" | "Zig/Wasm SIMD · 完整" | "Zig/Wasm · 快速" | "Zig/Wasm · 完整";
   mathMode: MathMode;
@@ -543,8 +620,15 @@ async function loadTrainingWasm() {
       typeof exports.train_dense_from_gradient === "function" &&
       typeof exports.conv2d_forward === "function" &&
       typeof exports.conv2d_train === "function" &&
+      typeof exports.conv2d_forward_batch === "function" &&
+      typeof exports.conv2d_train_batch === "function" &&
       typeof exports.pool2d_forward === "function" &&
       typeof exports.pool2d_backward === "function" &&
+      typeof exports.pool2d_forward_batch === "function" &&
+      typeof exports.pool2d_backward_batch === "function" &&
+      typeof exports.dense_forward_batch === "function" &&
+      typeof exports.dense_backward_batch === "function" &&
+      typeof exports.output_loss_batch === "function" &&
       typeof exports.apply_optimizer === "function" &&
       typeof exports.set_math_mode === "function" &&
       typeof exports.math_mode === "function" &&
@@ -562,6 +646,7 @@ function createWasmTrainingRuntime(
   optimizerConfig: OptimizerConfig | undefined,
   mathMode: MathMode,
   flavor: WasmKernelFlavor,
+  batchCapacity: number,
 ): WasmTrainingRuntime {
   applyWasmMathMode(wasm, mathMode);
   const sourceLayers = sourceModel.layers;
@@ -674,6 +759,68 @@ function createWasmTrainingRuntime(
   pointers.sampleValues = allocate(sampleCapacity * 4);
   pointers.inputGradient = allocate(sampleCapacity * 4);
 
+  const normalizedBatchCapacity = Math.max(1, Math.floor(batchCapacity));
+  const batchInputPointer = allocate(normalizedBatchCapacity * 784 * 4);
+  const batchLabelsPointer = allocate(normalizedBatchCapacity * 4, 4);
+  const batchLossesPointer = allocate(normalizedBatchCapacity * 4);
+  const spatialAllocations = [
+    ...sourceConvolutions.map((model, convolutionIndex) => ({
+      type: "conv" as const,
+      model,
+      convolutionIndex,
+    })),
+    ...sourcePoolings.map((model, poolingIndex) => ({
+      type: "pool" as const,
+      model,
+      poolingIndex,
+    })),
+  ].sort((left, right) =>
+    left.model.position - right.model.position || left.model.order - right.model.order);
+  const batchLayerAllocations: WasmBatchLayerAllocation[] = [];
+  let batchLayerInputPointer = batchInputPointer;
+  for (let layerIndex = 0; layerIndex < sourceLayers.length; layerIndex++) {
+    for (const spatial of spatialAllocations.filter(({ model }) => model.position === layerIndex)) {
+      const inputSize = spatial.model.inputWidth * spatial.model.inputHeight * spatial.model.inputChannels;
+      const outputChannels = spatial.type === "conv" ? spatial.model.filters : spatial.model.inputChannels;
+      const outputSize = spatial.model.outputWidth * spatial.model.outputHeight * outputChannels;
+      const outputPointer = allocate(normalizedBatchCapacity * outputSize * 4);
+      const allocation: WasmBatchLayerAllocation = {
+        type: spatial.type,
+        convolutionIndex: spatial.type === "conv" ? spatial.convolutionIndex : undefined,
+        poolingIndex: spatial.type === "pool" ? spatial.poolingIndex : undefined,
+        indicesPointer: spatial.type === "pool"
+          ? allocate(normalizedBatchCapacity * outputSize * 4, 4)
+          : 0,
+        inputPointer: batchLayerInputPointer,
+        outputPointer,
+        preactivationPointer: allocate(normalizedBatchCapacity * outputSize * 4),
+        deltaPointer: allocate(normalizedBatchCapacity * outputSize * 4),
+        inputGradientPointer: allocate(normalizedBatchCapacity * inputSize * 4),
+        dropoutMaskPointer: allocate(normalizedBatchCapacity * outputSize * 4),
+        inputSize,
+        outputSize,
+      };
+      batchLayerAllocations.push(allocation);
+      batchLayerInputPointer = outputPointer;
+    }
+    const layer = sourceLayers[layerIndex];
+    const outputPointer = allocate(normalizedBatchCapacity * layer.outputSize * 4);
+    batchLayerAllocations.push({
+      type: "dense",
+      layerIndex,
+      indicesPointer: 0,
+      inputPointer: batchLayerInputPointer,
+      outputPointer,
+      preactivationPointer: allocate(normalizedBatchCapacity * layer.outputSize * 4),
+      deltaPointer: allocate(normalizedBatchCapacity * layer.outputSize * 4),
+      inputGradientPointer: allocate(normalizedBatchCapacity * layer.inputSize * 4),
+      dropoutMaskPointer: allocate(normalizedBatchCapacity * layer.outputSize * 4),
+      inputSize: layer.inputSize,
+      outputSize: layer.outputSize,
+    });
+    batchLayerInputPointer = outputPointer;
+  }
+
   if (cursor > wasm.memory.buffer.byteLength) {
     wasm.memory.grow(Math.ceil((cursor - wasm.memory.buffer.byteLength) / 65536));
   }
@@ -765,6 +912,37 @@ function createWasmTrainingRuntime(
   });
   const spatialLayers: WasmSpatialRuntime[] = [...convolutions, ...poolings]
     .sort((left, right) => left.model.position - right.model.position || left.model.order - right.model.order);
+  const batchLayers = batchLayerAllocations.map((allocation): WasmBatchLayerRuntime => {
+    const common: WasmBatchLayerBase = {
+      inputPointer: allocation.inputPointer,
+      outputPointer: allocation.outputPointer,
+      preactivationPointer: allocation.preactivationPointer,
+      deltaPointer: allocation.deltaPointer,
+      inputGradientPointer: allocation.inputGradientPointer,
+      dropoutMaskPointer: allocation.dropoutMaskPointer,
+      inputSize: allocation.inputSize,
+      outputSize: allocation.outputSize,
+      input: new Float32Array(buffer, allocation.inputPointer, normalizedBatchCapacity * allocation.inputSize),
+      output: new Float32Array(buffer, allocation.outputPointer, normalizedBatchCapacity * allocation.outputSize),
+      preactivation: new Float32Array(buffer, allocation.preactivationPointer, normalizedBatchCapacity * allocation.outputSize),
+      delta: new Float32Array(buffer, allocation.deltaPointer, normalizedBatchCapacity * allocation.outputSize),
+      inputGradient: new Float32Array(buffer, allocation.inputGradientPointer, normalizedBatchCapacity * allocation.inputSize),
+      dropoutMask: new Float32Array(buffer, allocation.dropoutMaskPointer, normalizedBatchCapacity * allocation.outputSize),
+    };
+    common.dropoutMask.fill(1);
+    if (allocation.type === "dense") {
+      return { ...common, type: "dense", layerIndex: allocation.layerIndex! };
+    }
+    if (allocation.type === "conv") {
+      return { ...common, type: "conv", convolutionIndex: allocation.convolutionIndex! };
+    }
+    return {
+      ...common,
+      type: "pool",
+      poolingIndex: allocation.poolingIndex!,
+      indicesPointer: allocation.indicesPointer,
+    };
+  });
 
   const sampleIndices = new Uint16Array(buffer, pointers.sampleIndices, sampleCapacity);
 
@@ -791,6 +969,16 @@ function createWasmTrainingRuntime(
     convolutions,
     poolings,
     spatialLayers,
+    batch: {
+      capacity: normalizedBatchCapacity,
+      inputPointer: batchInputPointer,
+      labelsPointer: batchLabelsPointer,
+      lossesPointer: batchLossesPointer,
+      input: new Float32Array(buffer, batchInputPointer, normalizedBatchCapacity * 784),
+      labels: new Int32Array(buffer, batchLabelsPointer, normalizedBatchCapacity),
+      losses: new Float32Array(buffer, batchLossesPointer, normalizedBatchCapacity),
+      layers: batchLayers,
+    },
     outputHead: sourceModel.outputHead === "sigmoid" ? "sigmoid" : "softmax",
     backend: `${flavor === "simd" ? "Zig/Wasm SIMD" : "Zig/Wasm"} · ${mathMode === "full" ? "完整" : "快速"}`,
     mathMode,
@@ -1057,6 +1245,212 @@ function packNchwBatch(samples: SparseSample[]) {
   return tensor;
 }
 
+function forwardFullBatch(
+  runtime: WasmTrainingRuntime,
+  samples: SparseSample[],
+  training: boolean,
+) {
+  const batchSize = samples.length;
+  if (batchSize === 0 || batchSize > runtime.batch.capacity) {
+    throw new Error("完整数学批次大小超出 Wasm 缓冲区容量");
+  }
+  runtime.batch.input.set(packNchwBatch(samples), 0);
+  runtime.batch.labels.set(samples.map(({ label }) => label), 0);
+  if (training) runtime.sampleStep += batchSize;
+  const dropoutRates = new Float32Array(
+    runtime.wasm.memory.buffer,
+    runtime.pointers.dropoutRates,
+    runtime.model.length,
+  );
+
+  runtime.batch.layers.forEach((layer, networkIndex) => {
+    if (layer.type === "dense") {
+      const model = runtime.model[layer.layerIndex];
+      runtime.wasm.dense_forward_batch(
+        layer.inputPointer,
+        pointerAt(runtime, runtime.pointers.weights, layer.layerIndex),
+        pointerAt(runtime, runtime.pointers.biases, layer.layerIndex),
+        layer.outputPointer,
+        layer.preactivationPointer,
+        layer.dropoutMaskPointer,
+        batchSize,
+        layer.inputSize,
+        layer.outputSize,
+        activationCodes[model.activation],
+        dropoutRates[layer.layerIndex],
+        runtime.sampleStep >>> 0,
+        networkIndex,
+        training ? 1 : 0,
+      );
+      return;
+    }
+    if (layer.type === "conv") {
+      const convolution = runtime.convolutions[layer.convolutionIndex];
+      const { model, pointers } = convolution;
+      runtime.wasm.conv2d_forward_batch(
+        layer.inputPointer,
+        pointers.weights,
+        pointers.biases,
+        layer.outputPointer,
+        layer.preactivationPointer,
+        batchSize,
+        model.inputWidth,
+        model.inputHeight,
+        model.inputChannels,
+        model.filters,
+        model.kernelSize,
+        model.stride,
+        model.padding,
+        activationCodes[model.activation],
+      );
+      return;
+    }
+    const pooling = runtime.poolings[layer.poolingIndex].model;
+    runtime.wasm.pool2d_forward_batch(
+      layer.inputPointer,
+      layer.outputPointer,
+      layer.indicesPointer,
+      batchSize,
+      pooling.inputWidth,
+      pooling.inputHeight,
+      pooling.inputChannels,
+      pooling.kernelSize,
+      pooling.stride,
+      pooling.padding,
+      pooling.kind === "max" ? 0 : pooling.kind === "average" ? 1 : 2,
+    );
+  });
+
+  const outputLayer = runtime.batch.layers.at(-1);
+  if (!outputLayer || outputLayer.type !== "dense") {
+    throw new Error("完整数学路径缺少输出层");
+  }
+  runtime.wasm.output_loss_batch(
+    outputLayer.outputPointer,
+    outputLayer.deltaPointer,
+    runtime.batch.labelsPointer,
+    runtime.batch.lossesPointer,
+    batchSize,
+    outputLayer.outputSize,
+    runtime.outputHead === "sigmoid" ? 1 : 0,
+  );
+  return outputLayer;
+}
+
+function trainFullBatchWithWasm(
+  runtime: WasmTrainingRuntime,
+  samples: SparseSample[],
+  captureTrace = false,
+) {
+  const batchSize = samples.length;
+  const outputLayer = forwardFullBatch(runtime, samples, true);
+  for (let index = runtime.batch.layers.length - 1; index >= 0; index--) {
+    const layer = runtime.batch.layers[index];
+    const nextLayer = runtime.batch.layers[index + 1];
+    const outputGradientPointer = nextLayer
+      ? nextLayer.inputGradientPointer
+      : outputLayer.deltaPointer;
+    if (layer.type === "dense") {
+      const model = runtime.model[layer.layerIndex];
+      runtime.wasm.dense_backward_batch(
+        layer.inputPointer,
+        pointerAt(runtime, runtime.pointers.weights, layer.layerIndex),
+        layer.preactivationPointer,
+        outputGradientPointer,
+        layer.inputGradientPointer,
+        layer.deltaPointer,
+        pointerAt(runtime, runtime.pointers.weightGradients, layer.layerIndex),
+        pointerAt(runtime, runtime.pointers.biasGradients, layer.layerIndex),
+        layer.dropoutMaskPointer,
+        batchSize,
+        layer.inputSize,
+        layer.outputSize,
+        activationCodes[model.activation],
+      );
+      continue;
+    }
+    if (layer.type === "conv") {
+      const convolution = runtime.convolutions[layer.convolutionIndex];
+      const { model, pointers } = convolution;
+      runtime.wasm.conv2d_train_batch(
+        layer.inputPointer,
+        pointers.weights,
+        pointers.biases,
+        layer.preactivationPointer,
+        outputGradientPointer,
+        layer.inputGradientPointer,
+        layer.deltaPointer,
+        pointers.weightGradient,
+        pointers.biasGradient,
+        batchSize,
+        model.inputWidth,
+        model.inputHeight,
+        model.inputChannels,
+        model.filters,
+        model.kernelSize,
+        model.stride,
+        model.padding,
+        activationCodes[model.activation],
+        model.trainable ? 1 : 0,
+      );
+      continue;
+    }
+    const pooling = runtime.poolings[layer.poolingIndex].model;
+    runtime.wasm.pool2d_backward_batch(
+      outputGradientPointer,
+      layer.inputGradientPointer,
+      layer.deltaPointer,
+      layer.indicesPointer,
+      batchSize,
+      pooling.inputWidth,
+      pooling.inputHeight,
+      pooling.inputChannels,
+      pooling.kernelSize,
+      pooling.stride,
+      pooling.padding,
+      pooling.kind === "max" ? 0 : pooling.kind === "average" ? 1 : 2,
+    );
+  }
+
+  let totalLoss = 0;
+  for (let index = 0; index < batchSize; index++) {
+    const value = runtime.batch.losses[index];
+    if (!Number.isFinite(value)) throw new Error("Zig/Wasm 批量训练产生了无效损失");
+    totalLoss += value;
+  }
+  if (!captureTrace) return totalLoss;
+
+  let prediction = 0;
+  for (let index = 1; index < outputLayer.outputSize; index++) {
+    if (outputLayer.output[index] > outputLayer.output[prediction]) prediction = index;
+  }
+  return {
+    batchLoss: totalLoss,
+    loss: runtime.batch.losses[0],
+    activations: [
+      Float32Array.from(runtime.batch.input.subarray(0, 784)),
+      ...runtime.batch.layers.map((layer) =>
+        Float32Array.from(layer.output.subarray(0, layer.outputSize))),
+    ],
+    gradients: [
+      Float32Array.from(runtime.batch.layers[0].inputGradient.subarray(
+        0,
+        runtime.batch.layers[0].inputSize,
+      )),
+      ...runtime.batch.layers.map((layer) =>
+        Float32Array.from(layer.delta.subarray(0, layer.outputSize))),
+    ],
+    convolutionWeights: runtime.convolutions.map((convolution) =>
+      Float32Array.from(convolution.model.weights),
+    ),
+    convolutionBiases: runtime.convolutions.map((convolution) =>
+      Float32Array.from(convolution.model.biases),
+    ),
+    label: samples[0].label,
+    prediction,
+  } satisfies FullBatchTraceResult;
+}
+
 function trainSampleWithWasm(
   runtime: WasmTrainingRuntime,
   sample: SparseSample,
@@ -1245,6 +1639,23 @@ function applyBatchUpdates(runtime: WasmTrainingRuntime, learningRate: number, b
 function validateWithWasm(runtime: WasmTrainingRuntime, samples: SparseSample[]) {
   if (samples.length === 0) return 0;
   let correct = 0;
+  if (runtime.mathMode === "full") {
+    for (let start = 0; start < samples.length; start += runtime.batch.capacity) {
+      const batchSamples = samples.slice(start, start + runtime.batch.capacity);
+      const outputLayer = forwardFullBatch(runtime, batchSamples, false);
+      for (let batchIndex = 0; batchIndex < batchSamples.length; batchIndex++) {
+        const offset = batchIndex * outputLayer.outputSize;
+        let prediction = 0;
+        for (let digit = 1; digit < outputLayer.outputSize; digit++) {
+          if (outputLayer.output[offset + digit] > outputLayer.output[offset + prediction]) {
+            prediction = digit;
+          }
+        }
+        if (prediction === batchSamples[batchIndex].label) correct++;
+      }
+    }
+    return correct / samples.length;
+  }
   for (const sample of samples) {
     forwardWithWasm(runtime, sample);
     const probabilities = runtime.activations.at(-1)!;
@@ -1317,22 +1728,24 @@ async function train(message: TrainMessage) {
   const sourceModel = message.initialModel
     ? validateInitialModel(message.layers, convolutionConfigs, poolingConfigs, outputHead, message.initialModel)
     : initializeModel(message.layers, convolutionConfigs, poolingConfigs, outputHead);
+  const batchSize = Number.isFinite(message.settings.batchSize)
+    ? Math.max(1, Math.floor(message.settings.batchSize))
+    : 16;
+  const mathMode: MathMode = message.settings.mathMode === "full" ? "full" : "fast";
   const runtime = createWasmTrainingRuntime(
     loadedWasm.exports,
     sourceModel,
     message.layers,
     message.settings.optimizer,
-    message.settings.mathMode === "full" ? "full" : "fast",
+    mathMode,
     loadedWasm.flavor,
+    mathMode === "full" ? batchSize : 1,
   );
   activeRuntime = runtime;
   if (!Number.isFinite(message.settings.learningRate) || message.settings.learningRate <= 0) {
     throw new Error("学习率必须是大于 0 的有限数值");
   }
   const random = seededRandom(architectureSeed(message.layers, convolutionConfigs, poolingConfigs, outputHead) ^ 0x9e3779b9);
-  const batchSize = Number.isFinite(message.settings.batchSize)
-    ? Math.max(1, Math.floor(message.settings.batchSize))
-    : 16;
   let lastAccuracy = 0;
   activeSnapshotProgress = {
     epoch: 0,
@@ -1346,6 +1759,23 @@ async function train(message: TrainMessage) {
   let lastTraceAt = -Infinity;
   let lastControlYieldAt = performance.now();
   const traceInterval = Math.max(1, Math.floor(training.length / 6));
+  const emitTrace = (result: SampleTraceResult, epoch: number, sample: number) => {
+    lastTraceAt = performance.now();
+    postMessage({
+      type: "trace",
+      epoch,
+      sample,
+      samples: training.length,
+      activations: result.activations,
+      gradients: result.gradients,
+      convolutionWeights: result.convolutionWeights,
+      convolutionBiases: result.convolutionBiases,
+      label: result.label,
+      prediction: result.prediction,
+      loss: result.loss,
+      backend: runtime.backend,
+    });
+  };
 
   for (let epoch = 0; epoch < epochs; epoch++) {
     for (let cursor = training.length - 1; cursor > 0; cursor--) {
@@ -1355,69 +1785,94 @@ async function train(message: TrainMessage) {
     const learningRate =
       message.settings.learningRate * Math.pow(0.94, epoch);
     let loss = 0;
-    let currentBatchTensor = new Float32Array(0);
-    for (let sampleIndex = 0; sampleIndex < training.length; sampleIndex++) {
-      const sample = training[sampleIndex];
-      const batchOffset = sampleIndex % batchSize;
-      if (batchOffset === 0) {
-        currentBatchTensor = packNchwBatch(training.slice(sampleIndex, sampleIndex + batchSize));
-      }
-      const now = performance.now();
-      const captureTrace =
-        sampleIndex === 0 ||
-        (sampleIndex % traceInterval === 0 && now - lastTraceAt >= 90);
-      const result = trainSampleWithWasm(
-        runtime,
-        sample,
-        captureTrace,
-        currentBatchTensor.subarray(batchOffset * 784, (batchOffset + 1) * 784),
-      );
-      const batchCount = (sampleIndex % batchSize) + 1;
-      const batchComplete = batchCount === batchSize || sampleIndex === training.length - 1;
-      if (batchComplete) applyBatchUpdates(runtime, learningRate, batchCount);
-      if (typeof result === "number") {
-        loss += result;
-      } else {
-        loss += result.loss;
-        lastTraceAt = performance.now();
-        postMessage({
-          type: "trace",
-          epoch: epoch + 1,
-          sample: sampleIndex + 1,
-          samples: training.length,
-          activations: result.activations,
-          gradients: result.gradients,
-          convolutionWeights: result.convolutionWeights,
-          convolutionBiases: result.convolutionBiases,
-          label: result.label,
-          prediction: result.prediction,
-          loss: result.loss,
-          backend: runtime.backend,
-        });
-      }
+    if (runtime.mathMode === "full") {
+      for (let batchStart = 0; batchStart < training.length; batchStart += batchSize) {
+        const batchSamples = training.slice(batchStart, batchStart + batchSize);
+        const now = performance.now();
+        const captureTrace =
+          batchStart === 0 ||
+          (batchStart % traceInterval < batchSize && now - lastTraceAt >= 90);
+        const result = trainFullBatchWithWasm(runtime, batchSamples, captureTrace);
+        applyBatchUpdates(runtime, learningRate, batchSamples.length);
+        if (typeof result === "number") loss += result;
+        else {
+          loss += result.batchLoss;
+          emitTrace(result, epoch + 1, batchStart + 1);
+        }
+        const processed = batchStart + batchSamples.length;
+        activeSnapshotProgress.epoch = epoch + 1;
+        activeSnapshotProgress.sample = processed;
+        activeSnapshotProgress.accuracy = lastAccuracy;
+        activeSnapshotProgress.loss = loss / processed;
 
-      activeSnapshotProgress.epoch = epoch + 1;
-      activeSnapshotProgress.sample = sampleIndex + 1;
-      activeSnapshotProgress.accuracy = lastAccuracy;
-      activeSnapshotProgress.loss = loss / (sampleIndex + 1);
-
-      const shouldYield = captureTrace || performance.now() - lastControlYieldAt >= 32;
-      if (shouldYield) {
-        if (!(await waitForControl())) {
+        if (captureTrace || performance.now() - lastControlYieldAt >= 32) {
+          if (!(await waitForControl())) {
+            activeRuntime = null;
+            activeSnapshotProgress = null;
+            activeStartedAt = null;
+            postMessage({ type: "cancelled" });
+            return;
+          }
+          lastControlYieldAt = performance.now();
+        }
+        if (cancelled) {
           activeRuntime = null;
           activeSnapshotProgress = null;
           activeStartedAt = null;
           postMessage({ type: "cancelled" });
           return;
         }
-        lastControlYieldAt = performance.now();
       }
-      if (cancelled) {
-        activeRuntime = null;
-        activeSnapshotProgress = null;
-        activeStartedAt = null;
-        postMessage({ type: "cancelled" });
-        return;
+    } else {
+      let currentBatchTensor = new Float32Array(0);
+      for (let sampleIndex = 0; sampleIndex < training.length; sampleIndex++) {
+        const sample = training[sampleIndex];
+        const batchOffset = sampleIndex % batchSize;
+        if (batchOffset === 0) {
+          currentBatchTensor = packNchwBatch(training.slice(sampleIndex, sampleIndex + batchSize));
+        }
+        const now = performance.now();
+        const captureTrace =
+          sampleIndex === 0 ||
+          (sampleIndex % traceInterval === 0 && now - lastTraceAt >= 90);
+        const result = trainSampleWithWasm(
+          runtime,
+          sample,
+          captureTrace,
+          currentBatchTensor.subarray(batchOffset * 784, (batchOffset + 1) * 784),
+        );
+        const batchCount = (sampleIndex % batchSize) + 1;
+        const batchComplete = batchCount === batchSize || sampleIndex === training.length - 1;
+        if (batchComplete) applyBatchUpdates(runtime, learningRate, batchCount);
+        if (typeof result === "number") loss += result;
+        else {
+          loss += result.loss;
+          emitTrace(result, epoch + 1, sampleIndex + 1);
+        }
+
+        activeSnapshotProgress.epoch = epoch + 1;
+        activeSnapshotProgress.sample = sampleIndex + 1;
+        activeSnapshotProgress.accuracy = lastAccuracy;
+        activeSnapshotProgress.loss = loss / (sampleIndex + 1);
+
+        const shouldYield = captureTrace || performance.now() - lastControlYieldAt >= 32;
+        if (shouldYield) {
+          if (!(await waitForControl())) {
+            activeRuntime = null;
+            activeSnapshotProgress = null;
+            activeStartedAt = null;
+            postMessage({ type: "cancelled" });
+            return;
+          }
+          lastControlYieldAt = performance.now();
+        }
+        if (cancelled) {
+          activeRuntime = null;
+          activeSnapshotProgress = null;
+          activeStartedAt = null;
+          postMessage({ type: "cancelled" });
+          return;
+        }
       }
     }
     const accuracy = validateWithWasm(runtime, validation);

@@ -1029,6 +1029,347 @@ pub export fn conv2d_train(
     }
 }
 
+pub export fn dense_forward_batch(
+    input_ptr: u32,
+    weights_ptr: u32,
+    biases_ptr: u32,
+    output_ptr: u32,
+    preactivation_ptr: u32,
+    dropout_mask_ptr: u32,
+    batch_size_raw: i32,
+    input_size_raw: i32,
+    output_size_raw: i32,
+    activation_kind: i32,
+    dropout_rate: f32,
+    dropout_seed: u32,
+    layer_seed_raw: i32,
+    training_raw: i32,
+) void {
+    const batch_size: usize = @intCast(batch_size_raw);
+    const input_size: usize = @intCast(input_size_raw);
+    const output_size: usize = @intCast(output_size_raw);
+    const input = f32Ptr(input_ptr);
+    const weights = f32Ptr(weights_ptr);
+    const biases = f32Ptr(biases_ptr);
+    const output = f32Ptr(output_ptr);
+    const preactivation = f32Ptr(preactivation_ptr);
+    const dropout_mask = f32Ptr(dropout_mask_ptr);
+    const layer_seed: usize = @intCast(layer_seed_raw);
+    const training = training_raw != 0;
+
+    var batch: usize = 0;
+    while (batch < batch_size) : (batch += 1) {
+        const batch_input = input + batch * input_size;
+        const batch_output = output + batch * output_size;
+        const batch_preactivation = preactivation + batch * output_size;
+        const batch_mask = dropout_mask + batch * output_size;
+        var row: usize = 0;
+        while (row < output_size) : (row += 1) {
+            const value = biases[row] + dotProduct(weights + row * input_size, batch_input, input_size);
+            batch_preactivation[row] = value;
+            batch_output[row] = value;
+        }
+        activateBuffer(batch_output, output_size, activation_kind);
+        if (training) {
+            applyDropout(batch_output, batch_mask, output_size, dropout_rate, dropout_seed, layer_seed + batch);
+        } else {
+            var index: usize = 0;
+            while (index < output_size) : (index += 1) batch_mask[index] = 1.0;
+        }
+    }
+}
+
+pub export fn output_loss_batch(
+    output_ptr: u32,
+    delta_ptr: u32,
+    labels_ptr: u32,
+    losses_ptr: u32,
+    batch_size_raw: i32,
+    output_count_raw: i32,
+    output_head_kind: i32,
+) void {
+    const batch_size: usize = @intCast(batch_size_raw);
+    const output_count: usize = @intCast(output_count_raw);
+    const outputs = f32Ptr(output_ptr);
+    const deltas = f32Ptr(delta_ptr);
+    const labels = i32Ptr(labels_ptr);
+    const losses = f32Ptr(losses_ptr);
+
+    var batch: usize = 0;
+    while (batch < batch_size) : (batch += 1) {
+        const probabilities = outputs + batch * output_count;
+        const output_delta = deltas + batch * output_count;
+        const label: usize = @intCast(labels[batch]);
+        activateBuffer(probabilities, output_count, if (output_head_kind == 1) 3 else 5);
+        var index: usize = 0;
+        var loss: f32 = 0.0;
+        while (index < output_count) : (index += 1) {
+            const target: f32 = if (index == label) 1.0 else 0.0;
+            output_delta[index] = probabilities[index] - target;
+            if (output_head_kind == 1) {
+                var probability = probabilities[index];
+                if (probability < 0.000001) probability = 0.000001;
+                if (probability > 0.999999) probability = 0.999999;
+                loss -= (if (target > 0.5)
+                    mathLog(probability)
+                else
+                    mathLog(1.0 - probability)) / @as(f32, @floatFromInt(output_count));
+                output_delta[index] /= @as(f32, @floatFromInt(output_count));
+            }
+        }
+        if (output_head_kind != 1) {
+            var label_probability = probabilities[label];
+            if (label_probability < 0.00000001) label_probability = 0.00000001;
+            loss = -mathLog(label_probability);
+        }
+        losses[batch] = loss;
+    }
+}
+
+pub export fn dense_backward_batch(
+    input_ptr: u32,
+    weights_ptr: u32,
+    preactivation_ptr: u32,
+    output_gradient_ptr: u32,
+    input_gradient_ptr: u32,
+    delta_ptr: u32,
+    weight_gradient_ptr: u32,
+    bias_gradient_ptr: u32,
+    dropout_mask_ptr: u32,
+    batch_size_raw: i32,
+    input_size_raw: i32,
+    output_size_raw: i32,
+    activation_kind: i32,
+) void {
+    const batch_size: usize = @intCast(batch_size_raw);
+    const input_size: usize = @intCast(input_size_raw);
+    const output_size: usize = @intCast(output_size_raw);
+    const inputs = f32Ptr(input_ptr);
+    const weights = f32Ptr(weights_ptr);
+    const preactivations = f32Ptr(preactivation_ptr);
+    const output_gradients = f32Ptr(output_gradient_ptr);
+    const input_gradients = f32Ptr(input_gradient_ptr);
+    const deltas = f32Ptr(delta_ptr);
+    const weight_gradients = f32Ptr(weight_gradient_ptr);
+    const bias_gradients = f32Ptr(bias_gradient_ptr);
+    const dropout_masks = f32Ptr(dropout_mask_ptr);
+
+    var batch: usize = 0;
+    while (batch < batch_size) : (batch += 1) {
+        const input = inputs + batch * input_size;
+        const output_gradient = output_gradients + batch * output_size;
+        const input_gradient = input_gradients + batch * input_size;
+        const delta = deltas + batch * output_size;
+        var output: usize = 0;
+        while (output < output_size) : (output += 1) {
+            delta[output] = clampDelta(output_gradient[output]);
+        }
+        applyTrainingActivationDerivative(
+            delta,
+            preactivations + batch * output_size,
+            dropout_masks + batch * output_size,
+            output_size,
+            activation_kind,
+        );
+        fillZero(input_gradient, input_size);
+        output = 0;
+        while (output < output_size) : (output += 1) {
+            const gradient = clampDelta(delta[output]);
+            const offset = output * input_size;
+            accumulateScaled(input_gradient, weights + offset, input_size, gradient);
+            var input_index: usize = 0;
+            const gradient_lanes: F32x4 = @splat(gradient);
+            while (input_index + 4 <= input_size) : (input_index += 4) {
+                const weight_index = offset + input_index;
+                storeF32x4(
+                    weight_gradients,
+                    weight_index,
+                    loadF32x4(weight_gradients, weight_index) + loadF32x4(input, input_index) * gradient_lanes,
+                );
+            }
+            while (input_index < input_size) : (input_index += 1) {
+                weight_gradients[offset + input_index] += gradient * input[input_index];
+            }
+            bias_gradients[output] += gradient;
+        }
+    }
+}
+
+pub export fn conv2d_forward_batch(
+    input_ptr: u32,
+    weights_ptr: u32,
+    biases_ptr: u32,
+    output_ptr: u32,
+    preactivation_ptr: u32,
+    batch_size_raw: i32,
+    input_width_raw: i32,
+    input_height_raw: i32,
+    input_channels_raw: i32,
+    filters_raw: i32,
+    kernel_size_raw: i32,
+    stride_raw: i32,
+    padding_raw: i32,
+    activation_kind: i32,
+) void {
+    const batch_size: usize = @intCast(batch_size_raw);
+    const input_size: usize = @intCast(input_width_raw * input_height_raw * input_channels_raw);
+    const output_width = @divTrunc(input_width_raw + padding_raw * 2 - kernel_size_raw, stride_raw) + 1;
+    const output_height = @divTrunc(input_height_raw + padding_raw * 2 - kernel_size_raw, stride_raw) + 1;
+    const output_size: usize = @intCast(output_width * output_height * filters_raw);
+    var batch: usize = 0;
+    while (batch < batch_size) : (batch += 1) {
+        conv2d_forward(
+            input_ptr + @as(u32, @intCast(batch * input_size * 4)),
+            weights_ptr,
+            biases_ptr,
+            output_ptr + @as(u32, @intCast(batch * output_size * 4)),
+            preactivation_ptr + @as(u32, @intCast(batch * output_size * 4)),
+            input_width_raw,
+            input_height_raw,
+            input_channels_raw,
+            filters_raw,
+            kernel_size_raw,
+            stride_raw,
+            padding_raw,
+            activation_kind,
+        );
+    }
+}
+
+pub export fn conv2d_train_batch(
+    input_ptr: u32,
+    weights_ptr: u32,
+    biases_ptr: u32,
+    preactivation_ptr: u32,
+    output_gradient_ptr: u32,
+    input_gradient_ptr: u32,
+    delta_ptr: u32,
+    weight_gradient_ptr: u32,
+    bias_gradient_ptr: u32,
+    batch_size_raw: i32,
+    input_width_raw: i32,
+    input_height_raw: i32,
+    input_channels_raw: i32,
+    filters_raw: i32,
+    kernel_size_raw: i32,
+    stride_raw: i32,
+    padding_raw: i32,
+    activation_kind: i32,
+    trainable_raw: i32,
+) void {
+    const batch_size: usize = @intCast(batch_size_raw);
+    const input_size: usize = @intCast(input_width_raw * input_height_raw * input_channels_raw);
+    const output_width = @divTrunc(input_width_raw + padding_raw * 2 - kernel_size_raw, stride_raw) + 1;
+    const output_height = @divTrunc(input_height_raw + padding_raw * 2 - kernel_size_raw, stride_raw) + 1;
+    const output_size: usize = @intCast(output_width * output_height * filters_raw);
+    var batch: usize = 0;
+    while (batch < batch_size) : (batch += 1) {
+        conv2d_train(
+            input_ptr + @as(u32, @intCast(batch * input_size * 4)),
+            weights_ptr,
+            biases_ptr,
+            preactivation_ptr + @as(u32, @intCast(batch * output_size * 4)),
+            output_gradient_ptr + @as(u32, @intCast(batch * output_size * 4)),
+            input_gradient_ptr + @as(u32, @intCast(batch * input_size * 4)),
+            delta_ptr + @as(u32, @intCast(batch * output_size * 4)),
+            weight_gradient_ptr,
+            bias_gradient_ptr,
+            input_width_raw,
+            input_height_raw,
+            input_channels_raw,
+            filters_raw,
+            kernel_size_raw,
+            stride_raw,
+            padding_raw,
+            activation_kind,
+            trainable_raw,
+        );
+    }
+}
+
+pub export fn pool2d_forward_batch(
+    input_ptr: u32,
+    output_ptr: u32,
+    index_ptr: u32,
+    batch_size_raw: i32,
+    input_width_raw: i32,
+    input_height_raw: i32,
+    channels_raw: i32,
+    kernel_size_raw: i32,
+    stride_raw: i32,
+    padding_raw: i32,
+    pooling_kind: i32,
+) void {
+    const batch_size: usize = @intCast(batch_size_raw);
+    const input_size: usize = @intCast(input_width_raw * input_height_raw * channels_raw);
+    const kernel_size = if (pooling_kind == 2) @max(input_width_raw, input_height_raw) else @max(kernel_size_raw, 1);
+    const stride = if (pooling_kind == 2) 1 else @max(stride_raw, 1);
+    const padding = if (pooling_kind == 2) 0 else @max(padding_raw, 0);
+    const output_width = if (pooling_kind == 2) 1 else @max(@divTrunc(input_width_raw + padding * 2 - kernel_size, stride) + 1, 1);
+    const output_height = if (pooling_kind == 2) 1 else @max(@divTrunc(input_height_raw + padding * 2 - kernel_size, stride) + 1, 1);
+    const output_size: usize = @intCast(output_width * output_height * channels_raw);
+    var batch: usize = 0;
+    while (batch < batch_size) : (batch += 1) {
+        pool2d_forward(
+            input_ptr + @as(u32, @intCast(batch * input_size * 4)),
+            output_ptr + @as(u32, @intCast(batch * output_size * 4)),
+            index_ptr + @as(u32, @intCast(batch * output_size * 4)),
+            input_width_raw,
+            input_height_raw,
+            channels_raw,
+            kernel_size_raw,
+            stride_raw,
+            padding_raw,
+            pooling_kind,
+        );
+    }
+}
+
+pub export fn pool2d_backward_batch(
+    output_gradient_ptr: u32,
+    input_gradient_ptr: u32,
+    delta_ptr: u32,
+    index_ptr: u32,
+    batch_size_raw: i32,
+    input_width_raw: i32,
+    input_height_raw: i32,
+    channels_raw: i32,
+    kernel_size_raw: i32,
+    stride_raw: i32,
+    padding_raw: i32,
+    pooling_kind: i32,
+) void {
+    const batch_size: usize = @intCast(batch_size_raw);
+    const input_size: usize = @intCast(input_width_raw * input_height_raw * channels_raw);
+    const kernel_size = if (pooling_kind == 2) @max(input_width_raw, input_height_raw) else @max(kernel_size_raw, 1);
+    const stride = if (pooling_kind == 2) 1 else @max(stride_raw, 1);
+    const padding = if (pooling_kind == 2) 0 else @max(padding_raw, 0);
+    const output_width = if (pooling_kind == 2) 1 else @max(@divTrunc(input_width_raw + padding * 2 - kernel_size, stride) + 1, 1);
+    const output_height = if (pooling_kind == 2) 1 else @max(@divTrunc(input_height_raw + padding * 2 - kernel_size, stride) + 1, 1);
+    const output_size: usize = @intCast(output_width * output_height * channels_raw);
+    var batch: usize = 0;
+    while (batch < batch_size) : (batch += 1) {
+        const gradient = f32Ptr(output_gradient_ptr) + batch * output_size;
+        const delta = f32Ptr(delta_ptr) + batch * output_size;
+        var output_index: usize = 0;
+        while (output_index < output_size) : (output_index += 1) {
+            delta[output_index] = clampDelta(gradient[output_index]);
+        }
+        pool2d_backward(
+            output_gradient_ptr + @as(u32, @intCast(batch * output_size * 4)),
+            input_gradient_ptr + @as(u32, @intCast(batch * input_size * 4)),
+            index_ptr + @as(u32, @intCast(batch * output_size * 4)),
+            input_width_raw,
+            input_height_raw,
+            channels_raw,
+            kernel_size_raw,
+            stride_raw,
+            padding_raw,
+            pooling_kind,
+        );
+    }
+}
+
 fn updateDenseChain(
     layer_count: usize,
     sample_indices: [*]u16,
