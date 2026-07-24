@@ -14,7 +14,7 @@
     "data:build": "node scripts/build-training-data.mjs",
     "model:train": "node scripts/train-model.mjs",
     "typecheck": "vue-tsc --noEmit",
-    "test": "npm run wasm:build && npm run typecheck && node scripts/verify-model.mjs && npm run build && node scripts/verify-training-worker.mjs"
+    "test": "npm run wasm:build && npm run typecheck && node scripts/verify-model.mjs && node scripts/verify-default-model.mjs && npm run build && node scripts/verify-training-worker.mjs"
   },
   "dependencies": {
     "@lucide/vue": "^1.25.0",

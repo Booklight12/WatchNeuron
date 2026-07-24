@@ -464,7 +464,7 @@ function handlePointerCancel() {
           <Check v-if="copyState === 'copied'" :size="16" />
           <Copy v-else :size="16" />
         </button>
-        <button class="icon-button" type="button" title="恢复校准模型" aria-label="恢复校准模型" @click="emit('reset')">
+        <button class="icon-button" type="button" title="恢复默认模型" aria-label="恢复默认模型" @click="emit('reset')">
           <RotateCcw :size="16" />
         </button>
         <span class="copy-status" aria-live="polite">{{ copyState === "copied" ? "网络描述已复制" : copyState === "error" ? "网络描述复制失败" : "" }}</span>

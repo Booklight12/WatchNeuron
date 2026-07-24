@@ -229,6 +229,31 @@ function normalizeSavedModelRecord(record: SavedModel): SavedModel {
   };
 }
 
+function architectureSignature(
+  layers: HiddenLayer[],
+  convolutionConfigs: ConvolutionConfig[],
+) {
+  return JSON.stringify({
+    layers: layers.map(({ units, activation, dropout }) => ({ units, activation, dropout })),
+    convolutions: convolutionConfigs
+      .filter((config) => config.enabled)
+      .map(({ position, filters, kernelSize, stride, padding, activation, kernels }) => ({
+        position,
+        filters,
+        kernelSize,
+        stride,
+        padding,
+        activation,
+        kernels,
+      })),
+  });
+}
+
+function architectureMatchesRecord(record: SavedModel) {
+  return architectureSignature(hiddenLayers.value, convolutions.value) ===
+    architectureSignature(record.hiddenLayers, convolutionConfigsFromRecord(record));
+}
+
 function storedCustomSamples(): CustomDatasetSample[] {
   try {
     const parsed = JSON.parse(localStorage.getItem("watchneuron-custom-samples") ?? "[]");
@@ -280,8 +305,15 @@ function viewFromHash(): AppView {
 const activeView = ref<AppView>(viewFromHash());
 const digitCanvas = ref<InstanceType<typeof DigitCanvas> | null>(null);
 const serialized = shallowRef<SerializedModel | null>(null);
+const bundledDefaultModel = shallowRef<SavedModel | null>(null);
 const trainedModel = shallowRef<NeuralModel | null>(null);
 const trainedEpochCount = ref(0);
+const trainedModelAccuracy = ref<number | null>(null);
+const hadStoredArchitecture = [
+  "watchneuron-architecture",
+  "watchneuron-convolutions",
+  "watchneuron-convolution",
+].some((key) => localStorage.getItem(key) !== null);
 const initialHiddenLayers = storedLayers();
 const hiddenLayers = ref<HiddenLayer[]>(initialHiddenLayers);
 const convolutions = ref<ConvolutionConfig[]>(
@@ -331,6 +363,9 @@ const modelStatus = computed(() => {
   if (trainedModel.value) return "trained" as const;
   return model.value?.calibrated ? ("calibrated" as const) : ("experimental" as const);
 });
+const displayedModelAccuracy = computed(
+  () => trainedModelAccuracy.value ?? serialized.value?.accuracy ?? null,
+);
 const parameterCount = computed(() => (model.value ? countParameters(model.value) : 0));
 const customTrainingCount = computed(
   () => customSamples.value.filter((sample) => sample.split === "training").length,
@@ -521,6 +556,30 @@ function cloneNeuralModel(model: NeuralModel): NeuralModel {
   };
 }
 
+async function applySavedModel(record: SavedModel) {
+  hiddenLayers.value = record.hiddenLayers.map((layer) => ({
+    ...layer,
+    dropout: Number.isFinite(layer.dropout) ? Math.min(0.95, Math.max(0, layer.dropout)) : 0,
+  }));
+  convolutions.value = convolutionConfigsFromRecord(record);
+  await nextTick();
+  trainedModel.value = cloneNeuralModel(record.model);
+  trainedEpochCount.value = Math.max(0, Math.floor(record.progress.epoch));
+  trainedModelAccuracy.value = Number.isFinite(record.progress.accuracy)
+    ? record.progress.accuracy
+    : null;
+  activeTrainingMode.value = "finetune";
+  trainingProgress.value = {
+    phase: "idle",
+    epoch: 0,
+    epochs: trainingProfiles.value.finetune.epochs,
+    accuracy: 0,
+    loss: 0,
+    elapsedMs: 0,
+  };
+  selectedLayer.value = Math.min(selectedLayer.value, layerSizes.value.length - 1);
+}
+
 function modelRecordName(
   source: SavedModelSource,
   trainingMode: TrainingMode,
@@ -603,24 +662,7 @@ async function loadSavedModel(record: SavedModel) {
   trainingTrace.value = null;
   modelSaveOperation++;
   modelSaveState.value = "idle";
-  hiddenLayers.value = record.hiddenLayers.map((layer) => ({
-    ...layer,
-    dropout: Number.isFinite(layer.dropout) ? Math.min(0.95, Math.max(0, layer.dropout)) : 0,
-  }));
-  convolutions.value = convolutionConfigsFromRecord(record);
-  await nextTick();
-  trainedModel.value = cloneNeuralModel(record.model);
-  trainedEpochCount.value = Math.max(0, Math.floor(record.progress.epoch));
-  activeTrainingMode.value = "finetune";
-  trainingProgress.value = {
-    phase: "idle",
-    epoch: 0,
-    epochs: trainingProfiles.value.finetune.epochs,
-    accuracy: 0,
-    loss: 0,
-    elapsedMs: 0,
-  };
-  selectedLayer.value = Math.min(selectedLayer.value, layerSizes.value.length - 1);
+  await applySavedModel(record);
   navigateTo("lab");
   runInference();
 }
@@ -773,6 +815,7 @@ function startTraining(mode: TrainingMode = "scratch") {
       trainingTrace.value = null;
       const completedModel = cloneNeuralModel(message.model as NeuralModel);
       trainedModel.value = completedModel;
+      trainedModelAccuracy.value = Number.isFinite(message.accuracy) ? message.accuracy : null;
       const cumulativeEpochs = baseEpochs + settings.epochs;
       trainedEpochCount.value = cumulativeEpochs;
       trainingProgress.value = {
@@ -885,10 +928,18 @@ function savePausedSnapshot() {
   trainingWorker?.postMessage({ type: "snapshot" });
 }
 
-function resetArchitecture() {
+async function resetArchitecture() {
   if (trainingWorker) cancelTraining();
+  if (bundledDefaultModel.value) {
+    trainingTrace.value = null;
+    await applySavedModel(bundledDefaultModel.value);
+    selectedLayer.value = 1;
+    runInference();
+    return;
+  }
   trainedModel.value = null;
   trainedEpochCount.value = 0;
+  trainedModelAccuracy.value = null;
   hiddenLayers.value = defaultLayers();
   convolutions.value = [];
   selectedLayer.value = 1;
@@ -901,6 +952,7 @@ watch(
     trainingTrace.value = null;
     trainedModel.value = null;
     trainedEpochCount.value = 0;
+    trainedModelAccuracy.value = null;
     trainingProgress.value = {
       phase: "idle",
       epoch: 0,
@@ -923,6 +975,7 @@ watch(
     trainingTrace.value = null;
     trainedModel.value = null;
     trainedEpochCount.value = 0;
+    trainedModelAccuracy.value = null;
     trainingProgress.value = {
       phase: "idle",
       epoch: 0,
@@ -990,12 +1043,20 @@ async function loadModelLibrary() {
 onMounted(async () => {
   window.addEventListener("hashchange", syncViewFromHash);
   try {
-    const [modelResponse] = await Promise.all([
+    const [modelResponse, bundledResponse] = await Promise.all([
       fetch(`${import.meta.env.BASE_URL}model.json`),
+      fetch(`${import.meta.env.BASE_URL}default-model.json`),
       engine.initialize(),
       loadModelLibrary(),
     ]);
     serialized.value = (await modelResponse.json()) as SerializedModel;
+    if (bundledResponse.ok) {
+      const record = normalizeSavedModelRecord((await bundledResponse.json()) as SavedModel);
+      bundledDefaultModel.value = record;
+      if (!hadStoredArchitecture || architectureMatchesRecord(record)) {
+        await applySavedModel(record);
+      }
+    }
     engine.setMathMode(trainingProfiles.value.mathMode);
     engineBackend.value = engine.backend;
     await nextTick();
@@ -1134,8 +1195,8 @@ onBeforeUnmount(() => {
           <span>
             {{ trainingFlowActive && trainingTrace
               ? `E${trainingTrace.epoch} · ${trainingTrace.sample.toLocaleString()}/${trainingTrace.samples.toLocaleString()}`
-              : serialized
-                ? `${(serialized.accuracy * 100).toFixed(1)}% 测试准确率`
+              : displayedModelAccuracy !== null
+                ? `${(displayedModelAccuracy * 100).toFixed(1)}% 测试准确率`
                 : "载入中" }}
           </span>
         </div>

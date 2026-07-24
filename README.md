@@ -53,7 +53,7 @@ npm test
 
 ## 模型
 
-`public/model.json` 包含默认的 `784 -> 32 -> 10` 校准模型、测试准确率和演示样本。需要在本地重新生成默认模型时运行：
+`public/default-model.json` 包含网站默认的完整训练模型：`Conv2D 4×3×3 / stride 2 → Dense 128 LeakyReLU → Dense 64 ReLU → 10`，来自本地模型记录“完整训练 · 07/24 15:58”，训练 100 轮，记录验证准确率为 `93.51%`。`public/model.json` 保留旧的 Dense 校准模型作为回退，并继续提供十个演示样本。需要在本地重新生成回退模型时运行：
 
 ```powershell
 npm run model:train
