@@ -16,6 +16,10 @@ fn p(index: u32) -> u32 {
   return params.values[index / 4u][index % 4u];
 }
 
+fn pf(index: u32) -> f32 {
+  return bitcast<f32>(p(index));
+}
+
 fn clamp_delta(value: f32) -> f32 {
   return clamp(value, -1e4, 1e4);
 }
@@ -322,6 +326,69 @@ fn conv_forward(@builtin(global_invocation_id) id: vec3<u32>) {
   }
 }
 
+const CONV_TILE = 16u;
+var<workgroup> conv_tile_input: array<f32, 256>;
+var<workgroup> conv_tile_weight: array<f32, 256>;
+
+@compute @workgroup_size(16, 16, 1)
+fn conv_forward_tiled(
+  @builtin(local_invocation_id) local_id: vec3<u32>,
+  @builtin(workgroup_id) workgroup_id: vec3<u32>,
+) {
+  let ow = conv_output_width();
+  let oh = conv_output_height();
+  let spatial_size = ow * oh;
+  let row_count = p(0u) * spatial_size;
+  let reduction_size = p(3u) * p(5u) * p(5u);
+  let row = workgroup_id.y * CONV_TILE + local_id.y;
+  let filter_index = workgroup_id.x * CONV_TILE + local_id.x;
+  var sum = 0.0;
+
+  for (var base = 0u; base < reduction_size; base += CONV_TILE) {
+    let input_k = base + local_id.x;
+    let weight_k = base + local_id.y;
+    var input_value = 0.0;
+    if (row < row_count && input_k < reduction_size) {
+      let batch = row / spatial_size;
+      let pixel = row % spatial_size;
+      let oy = pixel / ow;
+      let ox = pixel % ow;
+      let kernel_area = p(5u) * p(5u);
+      let channel = input_k / kernel_area;
+      let kernel_pixel = input_k % kernel_area;
+      let ky = kernel_pixel / p(5u);
+      let kx = kernel_pixel % p(5u);
+      let iy = i32(oy * p(6u) + ky) - i32(p(7u));
+      let ix = i32(ox * p(6u) + kx) - i32(p(7u));
+      if (iy >= 0 && iy < i32(p(2u)) && ix >= 0 && ix < i32(p(1u))) {
+        input_value = input.values[
+          ((batch * p(3u) + channel) * p(2u) + u32(iy)) * p(1u) + u32(ix)
+        ];
+      }
+    }
+    conv_tile_input[local_id.y * CONV_TILE + local_id.x] = input_value;
+    conv_tile_weight[local_id.y * CONV_TILE + local_id.x] = select(
+      0.0,
+      weights.values[filter_index * reduction_size + weight_k],
+      filter_index < p(4u) && weight_k < reduction_size,
+    );
+    workgroupBarrier();
+    for (var tile_k = 0u; tile_k < CONV_TILE; tile_k++) {
+      sum += conv_tile_input[local_id.y * CONV_TILE + tile_k] *
+        conv_tile_weight[tile_k * CONV_TILE + local_id.x];
+    }
+    workgroupBarrier();
+  }
+
+  if (row >= row_count || filter_index >= p(4u)) { return; }
+  let batch = row / spatial_size;
+  let pixel = row % spatial_size;
+  let output_index = (batch * p(4u) + filter_index) * spatial_size + pixel;
+  let value = sum + biases.values[filter_index];
+  output2.values[output_index] = value;
+  output.values[output_index] = activation(value, p(8u));
+}
+
 @compute @workgroup_size(64)
 fn conv_delta(@builtin(global_invocation_id) id: vec3<u32>) {
   let ow = conv_output_width();
@@ -443,6 +510,84 @@ fn conv_parameter_gradient(@builtin(global_invocation_id) id: vec3<u32>) {
   }
 }
 
+var<workgroup> conv_tile_delta: array<f32, 256>;
+var<workgroup> conv_tile_patch: array<f32, 256>;
+
+@compute @workgroup_size(16, 16, 1)
+fn conv_weight_gradient_tiled(
+  @builtin(local_invocation_id) local_id: vec3<u32>,
+  @builtin(workgroup_id) workgroup_id: vec3<u32>,
+) {
+  let ow = conv_output_width();
+  let oh = conv_output_height();
+  let spatial_size = ow * oh;
+  let sample_count = p(0u) * spatial_size;
+  let reduction_size = p(3u) * p(5u) * p(5u);
+  let kernel_column = workgroup_id.x * CONV_TILE + local_id.x;
+  let filter_index = workgroup_id.y * CONV_TILE + local_id.y;
+  var sum = 0.0;
+
+  for (var base = 0u; base < sample_count; base += CONV_TILE) {
+    let delta_sample = base + local_id.x;
+    let patch_sample = base + local_id.y;
+    conv_tile_delta[local_id.y * CONV_TILE + local_id.x] = select(
+      0.0,
+      auxiliary.values[
+        (delta_sample / spatial_size * p(4u) + filter_index) * spatial_size +
+        delta_sample % spatial_size
+      ],
+      filter_index < p(4u) && delta_sample < sample_count,
+    );
+
+    var patch_value = 0.0;
+    if (patch_sample < sample_count && kernel_column < reduction_size) {
+      let batch = patch_sample / spatial_size;
+      let pixel = patch_sample % spatial_size;
+      let oy = pixel / ow;
+      let ox = pixel % ow;
+      let kernel_area = p(5u) * p(5u);
+      let channel = kernel_column / kernel_area;
+      let kernel_pixel = kernel_column % kernel_area;
+      let ky = kernel_pixel / p(5u);
+      let kx = kernel_pixel % p(5u);
+      let iy = i32(oy * p(6u) + ky) - i32(p(7u));
+      let ix = i32(ox * p(6u) + kx) - i32(p(7u));
+      if (iy >= 0 && iy < i32(p(2u)) && ix >= 0 && ix < i32(p(1u))) {
+        patch_value = input.values[
+          ((batch * p(3u) + channel) * p(2u) + u32(iy)) * p(1u) + u32(ix)
+        ];
+      }
+    }
+    conv_tile_patch[local_id.y * CONV_TILE + local_id.x] = patch_value;
+    workgroupBarrier();
+    for (var tile_k = 0u; tile_k < CONV_TILE; tile_k++) {
+      sum += conv_tile_delta[local_id.y * CONV_TILE + tile_k] *
+        conv_tile_patch[tile_k * CONV_TILE + local_id.x];
+    }
+    workgroupBarrier();
+  }
+
+  if (filter_index < p(4u) && kernel_column < reduction_size) {
+    output3.values[filter_index * reduction_size + kernel_column] = sum;
+  }
+}
+
+@compute @workgroup_size(64)
+fn conv_bias_gradient(@builtin(global_invocation_id) id: vec3<u32>) {
+  let filter_index = id.x;
+  if (filter_index >= p(4u)) { return; }
+  let spatial_size = conv_output_width() * conv_output_height();
+  var sum = 0.0;
+  for (var batch = 0u; batch < p(0u); batch++) {
+    for (var pixel = 0u; pixel < spatial_size; pixel++) {
+      sum += auxiliary.values[
+        (batch * p(4u) + filter_index) * spatial_size + pixel
+      ];
+    }
+  }
+  output4.values[filter_index] = sum;
+}
+
 @compute @workgroup_size(64)
 fn pool_forward(@builtin(global_invocation_id) id: vec3<u32>) {
   let batch_size = p(0u);
@@ -540,4 +685,55 @@ fn pool_backward(@builtin(global_invocation_id) id: vec3<u32>) {
     }
   }
   output.values[index] = clamp_delta(sum);
+}
+
+@compute @workgroup_size(64)
+fn optimizer_update(@builtin(global_invocation_id) id: vec3<u32>) {
+  let index = id.x;
+  let length = p(0u);
+  if (index >= length) { return; }
+
+  let optimizer_kind = p(1u);
+  let learning_rate = pf(2u);
+  let momentum = pf(3u);
+  let decay = pf(4u);
+  let beta1 = pf(5u);
+  let beta2 = pf(6u);
+  let epsilon = pf(7u);
+  let beta1_correction = pf(8u);
+  let beta2_correction = pf(9u);
+  let gradient = output2.values[index] * pf(10u);
+  let weight_decay = pf(11u);
+
+  var parameter = output.values[index];
+  if (weight_decay > 0.0) {
+    parameter *= 1.0 - learning_rate * weight_decay;
+  }
+  if (optimizer_kind == 0u) {
+    parameter -= learning_rate * gradient;
+  } else if (optimizer_kind == 1u) {
+    let velocity = momentum * output3.values[index] + gradient;
+    output3.values[index] = velocity;
+    parameter -= learning_rate * velocity;
+  } else if (optimizer_kind == 2u) {
+    let first_moment = beta1 * output3.values[index] + (1.0 - beta1) * gradient;
+    let second_moment = beta2 * output4.values[index] + (1.0 - beta2) * gradient * gradient;
+    output3.values[index] = first_moment;
+    output4.values[index] = second_moment;
+    parameter -= learning_rate *
+      (first_moment / beta1_correction) /
+      (sqrt(second_moment / beta2_correction) + epsilon);
+  } else if (optimizer_kind == 3u) {
+    let mean_square = decay * output4.values[index] + (1.0 - decay) * gradient * gradient;
+    output4.values[index] = mean_square;
+    parameter -= learning_rate * gradient / (sqrt(mean_square) + epsilon);
+  } else if (optimizer_kind == 4u) {
+    let accumulated_square = output4.values[index] + gradient * gradient;
+    output4.values[index] = accumulated_square;
+    parameter -= learning_rate * gradient / (sqrt(accumulated_square) + epsilon);
+  } else {
+    parameter -= learning_rate * gradient;
+  }
+  output.values[index] = parameter;
+  output2.values[index] = 0.0;
 }

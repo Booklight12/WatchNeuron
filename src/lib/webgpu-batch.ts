@@ -84,10 +84,20 @@ export interface WebGpuGraphResult {
   outputs: Float32Array[];
   deltas: Float32Array[];
   firstInputGradient: Float32Array | null;
-  gradients: Array<{
-    weightGradient: Float32Array;
-    biasGradient: Float32Array;
-  } | null>;
+}
+
+export interface WebGpuOptimizerStep {
+  kind: number;
+  learningRate: number;
+  momentum: number;
+  decay: number;
+  beta1: number;
+  beta2: number;
+  epsilon: number;
+  beta1Correction: number;
+  beta2Correction: number;
+  gradientScale: number;
+  weightDecay: number;
 }
 
 interface DispatchResult {
@@ -492,7 +502,13 @@ interface GraphOperation {
   bindGroup: any;
   parameterBuffer: any;
   items: (batchSize: number) => number;
-  parameters: (batchSize: number, sampleStep: number, training: boolean) => Uint32Array;
+  workgroups?: (batchSize: number) => [number, number, number];
+  parameters: (
+    batchSize: number,
+    sampleStep: number,
+    training: boolean,
+    optimizer?: WebGpuOptimizerStep,
+  ) => Uint32Array;
 }
 
 interface GraphLayer {
@@ -508,6 +524,10 @@ interface GraphLayer {
   biases: any;
   weightGradient: any;
   biasGradient: any;
+  weightFirst: any;
+  biasFirst: any;
+  weightSecond: any;
+  biasSecond: any;
 }
 
 interface ReadSection {
@@ -527,6 +547,7 @@ export class WebGpuTrainingGraph {
   private readonly layers: GraphLayer[];
   private readonly forwardOperations: GraphOperation[] = [];
   private readonly backwardOperations: GraphOperation[] = [];
+  private readonly optimizerOperations: GraphOperation[] = [];
   private readonly lossOperation: GraphOperation;
 
   constructor(
@@ -561,6 +582,18 @@ export class WebGpuTrainingGraph {
       const biasGradient = "biases" in descriptor
         ? this.createBuffer(descriptor.biases.byteLength)
         : this.dummy;
+      const weightFirst = "weights" in descriptor
+        ? this.createBuffer(descriptor.weights.byteLength)
+        : this.dummy;
+      const biasFirst = "biases" in descriptor
+        ? this.createBuffer(descriptor.biases.byteLength)
+        : this.dummy;
+      const weightSecond = "weights" in descriptor
+        ? this.createBuffer(descriptor.weights.byteLength)
+        : this.dummy;
+      const biasSecond = "biases" in descriptor
+        ? this.createBuffer(descriptor.biases.byteLength)
+        : this.dummy;
       const layer = {
         descriptor,
         input: previousOutput,
@@ -574,6 +607,10 @@ export class WebGpuTrainingGraph {
         biases,
         weightGradient,
         biasGradient,
+        weightFirst,
+        biasFirst,
+        weightSecond,
+        biasSecond,
       };
       previousOutput = output;
       return layer;
@@ -620,6 +657,7 @@ export class WebGpuTrainingGraph {
     writable: any[],
     items: GraphOperation["items"],
     parameters: GraphOperation["parameters"],
+    workgroups?: GraphOperation["workgroups"],
   ): GraphOperation {
     const parameterBuffer = this.executor.device.createBuffer({
       size: 64,
@@ -648,7 +686,7 @@ export class WebGpuTrainingGraph {
         { binding: 8, resource: { buffer: parameterBuffer } },
       ],
     });
-    return { pipeline, bindGroup, parameterBuffer, items, parameters };
+    return { pipeline, bindGroup, parameterBuffer, items, parameters, workgroups };
   }
 
   private convolutionParams(descriptor: Extract<WebGpuLayerDescriptor, { type: "conv" }>, batchSize: number) {
@@ -703,12 +741,21 @@ export class WebGpuTrainingGraph {
           ]),
         ));
       } else if (descriptor.type === "conv") {
+        const outputWidth =
+          Math.floor((descriptor.inputWidth + descriptor.padding * 2 - descriptor.kernelSize) / descriptor.stride) + 1;
+        const outputHeight =
+          Math.floor((descriptor.inputHeight + descriptor.padding * 2 - descriptor.kernelSize) / descriptor.stride) + 1;
         this.forwardOperations.push(this.operation(
-          "conv_forward",
+          "conv_forward_tiled",
           [layer.input, layer.weights, layer.biases, this.dummy],
           [layer.output, layer.preactivation, this.dummy, this.dummy],
           (batchSize) => batchSize * descriptor.outputSize,
           (batchSize) => parameterBlock(this.convolutionParams(descriptor, batchSize)),
+          (batchSize) => [
+            Math.ceil(descriptor.filters / 16),
+            Math.ceil(batchSize * outputWidth * outputHeight / 16),
+            1,
+          ],
         ));
       } else {
         this.forwardOperations.push(this.operation(
@@ -780,13 +827,29 @@ export class WebGpuTrainingGraph {
           ),
         );
         if (descriptor.trainable) {
-          this.backwardOperations.push(this.operation(
-            "conv_parameter_gradient",
-            [layer.input, this.dummy, this.dummy, layer.delta],
-            [this.dummy, this.dummy, layer.weightGradient, layer.biasGradient],
-            () => Math.max(descriptor.weights.length, descriptor.biases.length),
-            (batchSize) => parameterBlock(this.convolutionParams(descriptor, batchSize)),
-          ));
+          const reductionSize =
+            descriptor.inputChannels * descriptor.kernelSize * descriptor.kernelSize;
+          this.backwardOperations.push(
+            this.operation(
+              "conv_weight_gradient_tiled",
+              [layer.input, this.dummy, this.dummy, layer.delta],
+              [this.dummy, this.dummy, layer.weightGradient, this.dummy],
+              () => descriptor.weights.length,
+              (batchSize) => parameterBlock(this.convolutionParams(descriptor, batchSize)),
+              () => [
+                Math.ceil(reductionSize / 16),
+                Math.ceil(descriptor.filters / 16),
+                1,
+              ],
+            ),
+            this.operation(
+              "conv_bias_gradient",
+              [this.dummy, this.dummy, this.dummy, layer.delta],
+              [this.dummy, this.dummy, this.dummy, layer.biasGradient],
+              () => descriptor.biases.length,
+              (batchSize) => parameterBlock(this.convolutionParams(descriptor, batchSize)),
+            ),
+          );
         }
       } else {
         this.backwardOperations.push(this.operation(
@@ -798,16 +861,63 @@ export class WebGpuTrainingGraph {
         ));
       }
     }
+
+    this.layers.forEach((layer) => {
+      const descriptor = layer.descriptor;
+      if (!("weights" in descriptor) || (descriptor.type === "conv" && !descriptor.trainable)) {
+        return;
+      }
+      const optimizerParameters = (
+        length: number,
+        applyWeightDecay: boolean,
+        optimizer?: WebGpuOptimizerStep,
+      ) => {
+        if (!optimizer) throw new Error("WebGPU 优化器参数缺失");
+        return parameterBlock([
+          length,
+          optimizer.kind,
+          floatBits(optimizer.learningRate),
+          floatBits(optimizer.momentum),
+          floatBits(optimizer.decay),
+          floatBits(optimizer.beta1),
+          floatBits(optimizer.beta2),
+          floatBits(optimizer.epsilon),
+          floatBits(optimizer.beta1Correction),
+          floatBits(optimizer.beta2Correction),
+          floatBits(optimizer.gradientScale),
+          floatBits(applyWeightDecay ? optimizer.weightDecay : 0),
+        ]);
+      };
+      this.optimizerOperations.push(
+        this.operation(
+          "optimizer_update",
+          [this.dummy, this.dummy, this.dummy, this.dummy],
+          [layer.weights, layer.weightGradient, layer.weightFirst, layer.weightSecond],
+          () => descriptor.weights.length,
+          (_batchSize, _sampleStep, _training, optimizer) =>
+            optimizerParameters(descriptor.weights.length, true, optimizer),
+        ),
+        this.operation(
+          "optimizer_update",
+          [this.dummy, this.dummy, this.dummy, this.dummy],
+          [layer.biases, layer.biasGradient, layer.biasFirst, layer.biasSecond],
+          () => descriptor.biases.length,
+          (_batchSize, _sampleStep, _training, optimizer) =>
+            optimizerParameters(descriptor.biases.length, false, optimizer),
+        ),
+      );
+    });
   }
 
   private encodeOperation(
-    encoder: any,
+    pass: any,
     operation: GraphOperation,
     batchSize: number,
     sampleStep: number,
     training: boolean,
+    optimizer?: WebGpuOptimizerStep,
   ) {
-    const parameters = operation.parameters(batchSize, sampleStep, training);
+    const parameters = operation.parameters(batchSize, sampleStep, training, optimizer);
     this.executor.device.queue.writeBuffer(
       operation.parameterBuffer,
       0,
@@ -815,11 +925,14 @@ export class WebGpuTrainingGraph {
       parameters.byteOffset,
       parameters.byteLength,
     );
-    const pass = encoder.beginComputePass();
     pass.setPipeline(operation.pipeline);
     pass.setBindGroup(0, operation.bindGroup);
-    pass.dispatchWorkgroups(Math.max(1, Math.ceil(operation.items(batchSize) / WORKGROUP_SIZE)));
-    pass.end();
+    const workgroups = operation.workgroups?.(batchSize);
+    if (workgroups) {
+      pass.dispatchWorkgroups(...workgroups);
+    } else {
+      pass.dispatchWorkgroups(Math.max(1, Math.ceil(operation.items(batchSize) / WORKGROUP_SIZE)));
+    }
   }
 
   private async readSections(encoder: any, sections: Omit<ReadSection, "offset">[]) {
@@ -891,9 +1004,13 @@ export class WebGpuTrainingGraph {
     const encoder = this.executor.device.createCommandEncoder({
       label: "WatchNeuron WebGPU forward graph",
     });
+    const pass = encoder.beginComputePass({
+      label: "WatchNeuron WebGPU forward pass",
+    });
     this.forwardOperations.forEach((operation) =>
-      this.encodeOperation(encoder, operation, batchSize, 0, false));
-    this.encodeOperation(encoder, this.lossOperation, batchSize, 0, false);
+      this.encodeOperation(pass, operation, batchSize, 0, false));
+    this.encodeOperation(pass, this.lossOperation, batchSize, 0, false);
+    pass.end();
     const finalSize = this.layers.at(-1)!.descriptor.outputSize;
     const [probabilities, losses] = await this.readSections(encoder, [
       { buffer: this.probabilities, byteLength: batchSize * finalSize * 4 },
@@ -911,31 +1028,27 @@ export class WebGpuTrainingGraph {
     batchSize: number,
     sampleStep: number,
     captureTrace: boolean,
+    optimizer: WebGpuOptimizerStep,
   ): Promise<WebGpuGraphResult> {
     this.uploadBatch(input, labels);
     const encoder = this.executor.device.createCommandEncoder({
       label: "WatchNeuron WebGPU training graph",
     });
+    const pass = encoder.beginComputePass({
+      label: "WatchNeuron WebGPU training pass",
+    });
     this.forwardOperations.forEach((operation) =>
-      this.encodeOperation(encoder, operation, batchSize, sampleStep, true));
-    this.encodeOperation(encoder, this.lossOperation, batchSize, sampleStep, true);
+      this.encodeOperation(pass, operation, batchSize, sampleStep, true));
+    this.encodeOperation(pass, this.lossOperation, batchSize, sampleStep, true);
     this.backwardOperations.forEach((operation) =>
-      this.encodeOperation(encoder, operation, batchSize, sampleStep, true));
+      this.encodeOperation(pass, operation, batchSize, sampleStep, true));
+    this.optimizerOperations.forEach((operation) =>
+      this.encodeOperation(pass, operation, batchSize, sampleStep, true, optimizer));
+    pass.end();
 
     const sections: Omit<ReadSection, "offset">[] = [
       { buffer: this.losses, byteLength: batchSize * 4 },
     ];
-    const gradientLayerIndexes: number[] = [];
-    this.layers.forEach((layer, index) => {
-      if (!("weights" in layer.descriptor) || (layer.descriptor.type === "conv" && !layer.descriptor.trainable)) {
-        return;
-      }
-      gradientLayerIndexes.push(index);
-      sections.push(
-        { buffer: layer.weightGradient, byteLength: layer.descriptor.weights.byteLength },
-        { buffer: layer.biasGradient, byteLength: layer.descriptor.biases.byteLength },
-      );
-    });
     if (captureTrace) {
       sections.push({
         buffer: this.layers[0].inputGradient,
@@ -950,17 +1063,17 @@ export class WebGpuTrainingGraph {
           { buffer: layer.delta, byteLength: layer.descriptor.outputSize * 4 },
         );
       });
+      this.layers.forEach((layer) => {
+        if (!("weights" in layer.descriptor)) return;
+        sections.push(
+          { buffer: layer.weights, byteLength: layer.descriptor.weights.byteLength },
+          { buffer: layer.biases, byteLength: layer.descriptor.biases.byteLength },
+        );
+      });
     }
     const buffers = await this.readSections(encoder, sections);
     let cursor = 0;
     const losses = new Float32Array(buffers[cursor++]);
-    const gradients: WebGpuGraphResult["gradients"] = this.layers.map(() => null);
-    gradientLayerIndexes.forEach((layerIndex) => {
-      gradients[layerIndex] = {
-        weightGradient: new Float32Array(buffers[cursor++]),
-        biasGradient: new Float32Array(buffers[cursor++]),
-      };
-    });
     let firstInputGradient: Float32Array | null = null;
     const outputs: Float32Array[] = [];
     const deltas: Float32Array[] = [];
@@ -970,7 +1083,36 @@ export class WebGpuTrainingGraph {
         outputs.push(new Float32Array(buffers[cursor++]));
         deltas.push(new Float32Array(buffers[cursor++]));
       });
+      this.layers.forEach((layer) => {
+        if (!("weights" in layer.descriptor)) return;
+        layer.descriptor.weights.set(new Float32Array(buffers[cursor++]));
+        layer.descriptor.biases.set(new Float32Array(buffers[cursor++]));
+      });
     }
-    return { losses, outputs, deltas, firstInputGradient, gradients };
+    return { losses, outputs, deltas, firstInputGradient };
+  }
+
+  async downloadParameters(descriptors: WebGpuLayerDescriptor[]) {
+    const encoder = this.executor.device.createCommandEncoder({
+      label: "WatchNeuron WebGPU parameter download",
+    });
+    const parameterLayers: number[] = [];
+    const sections: Omit<ReadSection, "offset">[] = [];
+    this.layers.forEach((layer, index) => {
+      if (!("weights" in layer.descriptor)) return;
+      parameterLayers.push(index);
+      sections.push(
+        { buffer: layer.weights, byteLength: layer.descriptor.weights.byteLength },
+        { buffer: layer.biases, byteLength: layer.descriptor.biases.byteLength },
+      );
+    });
+    const buffers = await this.readSections(encoder, sections);
+    let cursor = 0;
+    parameterLayers.forEach((index) => {
+      const descriptor = descriptors[index];
+      if (!("weights" in descriptor)) return;
+      descriptor.weights.set(new Float32Array(buffers[cursor++]));
+      descriptor.biases.set(new Float32Array(buffers[cursor++]));
+    });
   }
 }

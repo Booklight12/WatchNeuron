@@ -1449,6 +1449,7 @@ async function forwardWebGpuBatch(
 async function trainWebGpuBatch(
   runtime: WasmTrainingRuntime,
   samples: SparseSample[],
+  learningRate: number,
   captureTrace = false,
 ) {
   const graph = runtime.webgpuGraph;
@@ -1458,49 +1459,30 @@ async function trainWebGpuBatch(
   runtime.batch.input.set(input, 0);
   runtime.batch.labels.set(samples.map(({ label }) => label), 0);
   runtime.sampleStep += batchSize;
+  runtime.step++;
+  runtime.beta1Power *= runtime.config.beta1;
+  runtime.beta2Power *= runtime.config.beta2;
   const result = await graph.train(
     input,
     runtime.batch.labels.subarray(0, batchSize),
     batchSize,
     runtime.sampleStep >>> 0,
     captureTrace,
+    {
+      kind: optimizerCodes[runtime.config.kind],
+      learningRate,
+      momentum: runtime.config.momentum,
+      decay: runtime.config.decay,
+      beta1: runtime.config.beta1,
+      beta2: runtime.config.beta2,
+      epsilon: runtime.config.epsilon,
+      beta1Correction: 1 - runtime.beta1Power,
+      beta2Correction: 1 - runtime.beta2Power,
+      gradientScale: 1 / Math.max(1, batchSize),
+      weightDecay: runtime.config.weightDecay,
+    },
   );
   runtime.batch.losses.set(result.losses);
-  for (let index = 0; index < runtime.batch.layers.length; index++) {
-    const layer = runtime.batch.layers[index];
-    const gradient = result.gradients[index];
-    if (!gradient) continue;
-    if (layer.type === "dense") {
-      const model = runtime.model[layer.layerIndex];
-      new Float32Array(
-        runtime.wasm.memory.buffer,
-        pointerAt(runtime, runtime.pointers.weightGradients, layer.layerIndex),
-        model.weights.length,
-      ).set(gradient.weightGradient);
-      new Float32Array(
-        runtime.wasm.memory.buffer,
-        pointerAt(runtime, runtime.pointers.biasGradients, layer.layerIndex),
-        model.biases.length,
-      ).set(gradient.biasGradient);
-      continue;
-    }
-    if (layer.type === "conv") {
-      const convolution = runtime.convolutions[layer.convolutionIndex];
-      const { model, pointers } = convolution;
-      if (model.trainable) {
-        new Float32Array(
-          runtime.wasm.memory.buffer,
-          pointers.weightGradient,
-          model.weights.length,
-        ).set(gradient.weightGradient);
-        new Float32Array(
-          runtime.wasm.memory.buffer,
-          pointers.biasGradient,
-          model.biases.length,
-        ).set(gradient.biasGradient);
-      }
-    }
-  }
 
   let totalLoss = 0;
   for (let index = 0; index < batchSize; index++) {
@@ -2017,32 +1999,51 @@ async function train(message: TrainMessage) {
       message.settings.learningRate * Math.pow(0.94, epoch);
     let loss = 0;
     if (runtime.mathMode === "full" || runtime.webgpu) {
-      for (let batchStart = 0; batchStart < training.length; batchStart += batchSize) {
-        const batchSamples = training.slice(batchStart, batchStart + batchSize);
-        const now = performance.now();
-        const captureTrace =
-          batchStart === 0 ||
-          (batchStart % traceInterval < batchSize && now - lastTraceAt >= 90);
-        const result = runtime.webgpu
-          ? await trainWebGpuBatch(runtime, batchSamples, captureTrace)
-          : trainFullBatchWithWasm(runtime, batchSamples, captureTrace);
-        applyBatchUpdates(runtime, learningRate, batchSamples.length);
-        if (runtime.webgpuGraph && runtime.webgpuDescriptors) {
-          runtime.webgpuGraph.uploadParameters(runtime.webgpuDescriptors);
-        }
-        if (typeof result === "number") loss += result;
-        else {
-          loss += result.batchLoss;
-          emitTrace(result, epoch + 1, batchStart + 1);
-        }
-        const processed = batchStart + batchSamples.length;
-        activeSnapshotProgress.epoch = epoch + 1;
-        activeSnapshotProgress.sample = processed;
-        activeSnapshotProgress.accuracy = lastAccuracy;
-        activeSnapshotProgress.loss = loss / processed;
-
-        if (captureTrace || performance.now() - lastControlYieldAt >= 32) {
-          if (!(await waitForControl())) {
+      if (runtime.webgpu) {
+        const pipelineDepth = 4;
+        for (
+          let groupStart = 0;
+          groupStart < training.length;
+          groupStart += batchSize * pipelineDepth
+        ) {
+          const pending: Array<{
+            batchStart: number;
+            batchSamples: SparseSample[];
+            captureTrace: boolean;
+            result: ReturnType<typeof trainWebGpuBatch>;
+          }> = [];
+          for (
+            let batchStart = groupStart;
+            batchStart < Math.min(training.length, groupStart + batchSize * pipelineDepth);
+            batchStart += batchSize
+          ) {
+            const batchSamples = training.slice(batchStart, batchStart + batchSize);
+            const captureTrace =
+              batchStart === 0 ||
+              (batchStart === groupStart && performance.now() - lastTraceAt >= 90);
+            pending.push({
+              batchStart,
+              batchSamples,
+              captureTrace,
+              result: trainWebGpuBatch(runtime, batchSamples, learningRate, captureTrace),
+            });
+          }
+          const results = await Promise.all(pending.map(({ result }) => result));
+          results.forEach((result, index) => {
+            const { batchStart, batchSamples, captureTrace } = pending[index];
+            if (typeof result === "number") loss += result;
+            else {
+              loss += result.batchLoss;
+              emitTrace(result, epoch + 1, batchStart + 1);
+            }
+            const processed = batchStart + batchSamples.length;
+            activeSnapshotProgress!.epoch = epoch + 1;
+            activeSnapshotProgress!.sample = processed;
+            activeSnapshotProgress!.accuracy = lastAccuracy;
+            activeSnapshotProgress!.loss = loss / processed;
+            if (captureTrace) lastControlYieldAt = performance.now();
+          });
+          if (!(await waitForControl()) || cancelled) {
             activeRuntime = null;
             activeSnapshotProgress = null;
             activeStartedAt = null;
@@ -2051,12 +2052,43 @@ async function train(message: TrainMessage) {
           }
           lastControlYieldAt = performance.now();
         }
-        if (cancelled) {
-          activeRuntime = null;
-          activeSnapshotProgress = null;
-          activeStartedAt = null;
-          postMessage({ type: "cancelled" });
-          return;
+      } else {
+        for (let batchStart = 0; batchStart < training.length; batchStart += batchSize) {
+          const batchSamples = training.slice(batchStart, batchStart + batchSize);
+          const now = performance.now();
+          const captureTrace =
+            batchStart === 0 ||
+            (batchStart % traceInterval < batchSize && now - lastTraceAt >= 90);
+          const result = trainFullBatchWithWasm(runtime, batchSamples, captureTrace);
+          applyBatchUpdates(runtime, learningRate, batchSamples.length);
+          if (typeof result === "number") loss += result;
+          else {
+            loss += result.batchLoss;
+            emitTrace(result, epoch + 1, batchStart + 1);
+          }
+          const processed = batchStart + batchSamples.length;
+          activeSnapshotProgress.epoch = epoch + 1;
+          activeSnapshotProgress.sample = processed;
+          activeSnapshotProgress.accuracy = lastAccuracy;
+          activeSnapshotProgress.loss = loss / processed;
+
+          if (captureTrace || performance.now() - lastControlYieldAt >= 32) {
+            if (!(await waitForControl())) {
+              activeRuntime = null;
+              activeSnapshotProgress = null;
+              activeStartedAt = null;
+              postMessage({ type: "cancelled" });
+              return;
+            }
+            lastControlYieldAt = performance.now();
+          }
+          if (cancelled) {
+            activeRuntime = null;
+            activeSnapshotProgress = null;
+            activeStartedAt = null;
+            postMessage({ type: "cancelled" });
+            return;
+          }
         }
       }
     } else {
@@ -2136,7 +2168,10 @@ async function train(message: TrainMessage) {
     }
   }
 
-  const accuracy = await validateWithWasm(runtime, validation);
+  const accuracy = lastAccuracy;
+  if (runtime.webgpuGraph && runtime.webgpuDescriptors) {
+    await runtime.webgpuGraph.downloadParameters(runtime.webgpuDescriptors);
+  }
   const completedModel = cloneWasmModel(runtime);
   const transfer = completedModel.layers.flatMap((layer) => [
     layer.weights.buffer,
@@ -2162,7 +2197,7 @@ async function train(message: TrainMessage) {
   activeStartedAt = null;
 }
 
-self.onmessage = (event: MessageEvent<TrainMessage | CancelMessage | PauseMessage | ResumeMessage | SnapshotMessage>) => {
+self.onmessage = async (event: MessageEvent<TrainMessage | CancelMessage | PauseMessage | ResumeMessage | SnapshotMessage>) => {
   if (event.data.type === "cancel") {
     cancelled = true;
     wakeControlWaiters();
@@ -2188,6 +2223,9 @@ self.onmessage = (event: MessageEvent<TrainMessage | CancelMessage | PauseMessag
   }
   if (event.data.type === "snapshot") {
     if (paused && activeRuntime && activeSnapshotProgress && activeStartedAt !== null) {
+      if (activeRuntime.webgpuGraph && activeRuntime.webgpuDescriptors) {
+        await activeRuntime.webgpuGraph.downloadParameters(activeRuntime.webgpuDescriptors);
+      }
       postMessage({
         type: "snapshot",
         model: cloneWasmModel(activeRuntime),

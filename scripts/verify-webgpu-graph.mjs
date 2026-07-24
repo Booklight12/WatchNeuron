@@ -3,6 +3,7 @@ import { createServer } from "vite";
 
 let submissionCount = 0;
 let bufferCount = 0;
+let computePassCount = 0;
 
 class MockBuffer {
   constructor(size) {
@@ -48,12 +49,15 @@ const device = {
   createBindGroup: ({ entries }) => ({ entries }),
   createBuffer: ({ size }) => new MockBuffer(size),
   createCommandEncoder: () => ({
-    beginComputePass: () => ({
-      setPipeline() {},
-      setBindGroup() {},
-      dispatchWorkgroups() {},
-      end() {},
-    }),
+    beginComputePass: () => {
+      computePassCount++;
+      return {
+        setPipeline() {},
+        setBindGroup() {},
+        dispatchWorkgroups() {},
+        end() {},
+      };
+    },
     copyBufferToBuffer(source, sourceOffset, target, targetOffset, size) {
       target.bytes.set(
         source.bytes.subarray(sourceOffset, sourceOffset + size),
@@ -130,19 +134,34 @@ try {
   const labels = new Int32Array([0, 1]);
 
   const forwardSubmissions = submissionCount;
+  const forwardPasses = computePassCount;
   const forward = await graph.forward(input, labels, 2);
   assert.equal(submissionCount - forwardSubmissions, 1, "forward graph must submit once per batch");
+  assert.equal(computePassCount - forwardPasses, 1, "forward graph must use one compute pass");
   assert.equal(bufferCount - persistentBufferCount, 1, "forward graph may allocate only one staging buffer");
   assert.equal(forward.probabilities.length, 20);
   assert.equal(forward.losses.length, 2);
 
   const buffersAfterForward = bufferCount;
   const trainingSubmissions = submissionCount;
-  const training = await graph.train(input, labels, 2, 2, false);
+  const trainingPasses = computePassCount;
+  const training = await graph.train(input, labels, 2, 2, false, {
+    kind: 2,
+    learningRate: 0.003,
+    momentum: 0.9,
+    decay: 0.9,
+    beta1: 0.9,
+    beta2: 0.999,
+    epsilon: 1e-8,
+    beta1Correction: 0.1,
+    beta2Correction: 0.001,
+    gradientScale: 0.5,
+    weightDecay: 0.01,
+  });
   assert.equal(submissionCount - trainingSubmissions, 1, "training graph must submit once per batch");
+  assert.equal(computePassCount - trainingPasses, 1, "training graph must use one compute pass");
   assert.equal(bufferCount - buffersAfterForward, 1, "training graph may allocate only one staging buffer");
   assert.equal(training.losses.length, 2);
-  assert.equal(training.gradients.filter(Boolean).length, 2);
 
   const buffersBeforeUpload = bufferCount;
   graph.uploadParameters(descriptors);
