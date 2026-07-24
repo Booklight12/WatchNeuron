@@ -14,6 +14,9 @@ if (
   typeof instance.exports.train_dense_from_gradient !== "function" ||
   typeof instance.exports.conv2d_forward !== "function" ||
   typeof instance.exports.conv2d_train !== "function" ||
+  typeof instance.exports.pool2d_forward !== "function" ||
+  typeof instance.exports.pool2d_backward !== "function" ||
+  typeof instance.exports.apply_optimizer !== "function" ||
   typeof instance.exports.simd_enabled !== "function" ||
   typeof instance.exports.set_math_mode !== "function" ||
   typeof instance.exports.math_mode !== "function" ||
@@ -142,6 +145,204 @@ if (Math.abs(convOutput[12] - 1) > 1e-6 || convOutput.some((value, index) => ind
   throw new Error("Wasm Conv2D identity forward probe failed");
 }
 console.log("Wasm Conv2D forward probe: 5x5 identity kernel passed");
+
+const poolInputPtr = align(convPreactivationPtr + 25 * 4);
+const poolOutputPtr = align(poolInputPtr + 16 * 4);
+const poolIndicesPtr = align(poolOutputPtr + 4 * 4);
+const poolOutputGradientPtr = align(poolIndicesPtr + 4 * 4);
+const poolInputGradientPtr = align(poolOutputGradientPtr + 4 * 4);
+const poolInput = new Float32Array(memory.buffer, poolInputPtr, 16);
+const poolOutput = new Float32Array(memory.buffer, poolOutputPtr, 4);
+const poolIndices = new Uint32Array(memory.buffer, poolIndicesPtr, 4);
+const poolOutputGradient = new Float32Array(memory.buffer, poolOutputGradientPtr, 4);
+const poolInputGradient = new Float32Array(memory.buffer, poolInputGradientPtr, 16);
+poolInput.set(Array.from({ length: 16 }, (_, index) => index + 1));
+
+function assertArrayClose(actual, expected, label, tolerance = 1e-6) {
+  if (
+    actual.length !== expected.length ||
+    actual.some((value, index) => !Number.isFinite(value) || Math.abs(value - expected[index]) > tolerance)
+  ) {
+    throw new Error(`${label} failed: expected ${expected.join(", ")}; received ${actual.join(", ")}`);
+  }
+}
+
+instance.exports.pool2d_forward(
+  poolInputPtr,
+  poolOutputPtr,
+  poolIndicesPtr,
+  4,
+  4,
+  1,
+  2,
+  2,
+  0,
+  0,
+);
+assertArrayClose(Array.from(poolOutput), [6, 8, 14, 16], "Wasm MaxPool2D forward probe");
+assertArrayClose(Array.from(poolIndices), [5, 7, 13, 15], "Wasm MaxPool2D argmax probe");
+poolOutputGradient.fill(1);
+instance.exports.pool2d_backward(
+  poolOutputGradientPtr,
+  poolInputGradientPtr,
+  poolIndicesPtr,
+  4,
+  4,
+  1,
+  2,
+  2,
+  0,
+  0,
+);
+assertArrayClose(
+  Array.from(poolInputGradient),
+  [0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 1, 0, 1],
+  "Wasm MaxPool2D backward probe",
+);
+
+instance.exports.pool2d_forward(
+  poolInputPtr,
+  poolOutputPtr,
+  poolIndicesPtr,
+  4,
+  4,
+  1,
+  2,
+  2,
+  0,
+  1,
+);
+assertArrayClose(Array.from(poolOutput), [3.5, 5.5, 11.5, 13.5], "Wasm AvgPool2D forward probe");
+instance.exports.pool2d_backward(
+  poolOutputGradientPtr,
+  poolInputGradientPtr,
+  poolIndicesPtr,
+  4,
+  4,
+  1,
+  2,
+  2,
+  0,
+  1,
+);
+assertArrayClose(
+  Array.from(poolInputGradient),
+  new Array(16).fill(0.25),
+  "Wasm AvgPool2D backward probe",
+);
+
+instance.exports.pool2d_forward(
+  poolInputPtr,
+  poolOutputPtr,
+  poolIndicesPtr,
+  4,
+  4,
+  1,
+  1,
+  1,
+  0,
+  2,
+);
+assertArrayClose([poolOutput[0]], [8.5], "Wasm GAP forward probe");
+poolOutputGradient[0] = 1;
+instance.exports.pool2d_backward(
+  poolOutputGradientPtr,
+  poolInputGradientPtr,
+  poolIndicesPtr,
+  4,
+  4,
+  1,
+  1,
+  1,
+  0,
+  2,
+);
+assertArrayClose(
+  Array.from(poolInputGradient),
+  new Array(16).fill(1 / 16),
+  "Wasm GAP backward probe",
+);
+
+poolInput[0] = 7;
+instance.exports.pool2d_forward(
+  poolInputPtr,
+  poolOutputPtr,
+  poolIndicesPtr,
+  1,
+  1,
+  1,
+  4,
+  1,
+  0,
+  0,
+);
+assertArrayClose([poolOutput[0]], [7], "Wasm oversized MaxPool2D window probe");
+poolOutputGradient[0] = 1;
+instance.exports.pool2d_backward(
+  poolOutputGradientPtr,
+  poolInputGradientPtr,
+  poolIndicesPtr,
+  1,
+  1,
+  1,
+  4,
+  1,
+  0,
+  0,
+);
+assertArrayClose([poolInputGradient[0]], [1], "Wasm oversized MaxPool2D backward probe");
+console.log("Wasm Pool2D probes: MaxPool2D, AvgPool2D, GAP, and oversized windows passed");
+
+const optimizerParametersPtr = align(poolInputGradientPtr + 16 * 4);
+const optimizerGradientsPtr = align(optimizerParametersPtr + 3 * 4);
+const optimizerFirstPtr = align(optimizerGradientsPtr + 3 * 4);
+const optimizerSecondPtr = align(optimizerFirstPtr + 3 * 4);
+const optimizerParameters = new Float32Array(memory.buffer, optimizerParametersPtr, 3);
+const optimizerGradients = new Float32Array(memory.buffer, optimizerGradientsPtr, 3);
+const optimizerFirst = new Float32Array(memory.buffer, optimizerFirstPtr, 3);
+const optimizerSecond = new Float32Array(memory.buffer, optimizerSecondPtr, 3);
+optimizerParameters.set([2, -4, 3]);
+optimizerGradients.fill(0);
+optimizerFirst.fill(0);
+optimizerSecond.fill(0);
+instance.exports.apply_optimizer(
+  optimizerParametersPtr,
+  optimizerGradientsPtr,
+  optimizerFirstPtr,
+  optimizerSecondPtr,
+  2,
+  0,
+  0.1,
+  0.9,
+  0.9,
+  0.9,
+  0.999,
+  1e-8,
+  1,
+  1,
+  1,
+  0.5,
+);
+instance.exports.apply_optimizer(
+  optimizerParametersPtr + 2 * 4,
+  optimizerGradientsPtr + 2 * 4,
+  optimizerFirstPtr + 2 * 4,
+  optimizerSecondPtr + 2 * 4,
+  1,
+  0,
+  0.1,
+  0.9,
+  0.9,
+  0.9,
+  0.999,
+  1e-8,
+  1,
+  1,
+  1,
+  0,
+);
+assertArrayClose(Array.from(optimizerParameters), [1.9, -3.8, 3], "Wasm Weight Decay probe");
+console.log("Wasm optimizer probe: decoupled Weight Decay shrinks weights but not biases");
 
 function infer(input) {
   const floats = new Float32Array(memory.buffer);

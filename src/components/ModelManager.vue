@@ -12,8 +12,9 @@ import {
   X,
 } from "@lucide/vue";
 import { activationLabels } from "../lib/model";
-import { modelConvolutions } from "../lib/convolution";
+import { modelConvolutions, modelSpatialLayers } from "../lib/convolution";
 import type { SavedModel, SavedModelSource } from "../types";
+import SegmentedControl, { type SegmentedControlOption } from "./SegmentedControl.vue";
 
 const props = defineProps<{
   models: SavedModel[];
@@ -31,6 +32,11 @@ const emit = defineEmits<{
 type ModelFilter = "all" | SavedModelSource;
 
 const filter = ref<ModelFilter>("all");
+const modelFilterOptions: SegmentedControlOption[] = [
+  { value: "all", label: "全部" },
+  { value: "complete", label: "完整训练" },
+  { value: "paused", label: "暂停快照" },
+];
 const editingId = ref<string | null>(null);
 const draftName = ref("");
 const selectionMode = ref(false);
@@ -116,10 +122,11 @@ function modelSourceLabel(model: SavedModel) {
 
 function architectureItems(model: SavedModel) {
   const items = ["784"];
-  const convolutions = modelConvolutions(model.model);
   for (let position = 0; position <= model.hiddenLayers.length; position++) {
-    for (const convolution of convolutions.filter((item) => item.position === position)) {
-      items.push(`Conv2D ${convolution.filters}×${convolution.kernelSize}²`);
+    for (const layer of modelSpatialLayers(model.model).filter((item) => item.position === position)) {
+      items.push(layer.type === "conv"
+        ? `Conv2D ${layer.filters}×${layer.kernelSize}²`
+        : layer.kind === "globalAverage" ? "GAP" : layer.kind === "max" ? `MaxPool ${layer.kernelSize}²` : `AvgPool ${layer.kernelSize}²`);
     }
     if (position < model.hiddenLayers.length) {
       const layer = model.hiddenLayers[position];
@@ -127,7 +134,7 @@ function architectureItems(model: SavedModel) {
       items.push(`${layer.units} · ${activationLabels[layer.activation]}${dropout}`);
     }
   }
-  items.push("10 · Softmax");
+  items.push(`10 · ${model.model.outputHead === "sigmoid" ? "Sigmoid" : "Softmax"}`);
   return items;
 }
 
@@ -236,11 +243,12 @@ watch(
     </section>
 
     <section class="sample-manager-toolbar model-manager-toolbar" aria-label="模型筛选和批量操作">
-      <div class="sample-filter-tabs" role="group" aria-label="模型类型筛选">
-        <button type="button" :class="{ active: filter === 'all' }" @click="filter = 'all'">全部</button>
-        <button type="button" :class="{ active: filter === 'complete' }" @click="filter = 'complete'">完整训练</button>
-        <button type="button" :class="{ active: filter === 'paused' }" @click="filter = 'paused'">暂停快照</button>
-      </div>
+      <SegmentedControl
+        v-model="filter"
+        class="sample-filter-tabs"
+        :options="modelFilterOptions"
+        label="模型类型筛选"
+      />
 
       <span class="model-toolbar-result">{{ filteredModels.length }} 个结果</span>
 

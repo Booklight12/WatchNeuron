@@ -5,7 +5,7 @@ import type {
   NeuralModel,
 } from "../types";
 import { activateScalar } from "./activations";
-import { modelConvolutions } from "./convolution";
+import { modelSpatialLayers } from "./convolution";
 import {
   applyWasmMathMode,
   loadBestWasmKernel,
@@ -26,11 +26,14 @@ interface WasmExports extends MathModeWasmExports {
   ) => void;
   activate: (values: number, length: number, kind: number) => void;
   conv2d_forward: (...args: number[]) => void;
+  pool2d_forward: (...args: number[]) => void;
   simd_enabled: () => number;
 }
 
 interface PreparedConvolution {
+  kind: "conv";
   position: number;
+  order: number;
   inputPtr: number;
   weightsPtr: number;
   biasesPtr: number;
@@ -47,6 +50,25 @@ interface PreparedConvolution {
   activation: ActivationKind;
 }
 
+interface PreparedPooling {
+  kind: "pool";
+  position: number;
+  order: number;
+  inputPtr: number;
+  outputPtr: number;
+  indexPtr: number;
+  inputWidth: number;
+  inputHeight: number;
+  inputChannels: number;
+  outputSize: number;
+  kernelSize: number;
+  stride: number;
+  padding: number;
+  poolingKind: number;
+}
+
+type PreparedSpatialLayer = PreparedConvolution | PreparedPooling;
+
 interface PreparedLayer {
   inputPtr: number;
   weightsPtr: number;
@@ -59,7 +81,7 @@ interface PreparedLayer {
 
 interface PreparedModel {
   inputPtr: number;
-  convolutions: PreparedConvolution[];
+  spatialLayers: PreparedSpatialLayer[];
   layers: PreparedLayer[];
 }
 
@@ -94,6 +116,10 @@ function softmax(logits: ArrayLike<number>) {
   return values.map((value) => value / total);
 }
 
+function sigmoidScores(logits: ArrayLike<number>) {
+  return Array.from(logits, (value) => 1 / (1 + Math.exp(-value)));
+}
+
 export class InferenceEngine {
   private wasm: WasmExports | null = null;
   private wasmFlavor: WasmKernelFlavor | null = null;
@@ -121,6 +147,7 @@ export class InferenceEngine {
         typeof exports.matvec === "function" &&
         typeof exports.activate === "function" &&
         typeof exports.conv2d_forward === "function" &&
+        typeof exports.pool2d_forward === "function" &&
         typeof exports.set_math_mode === "function" &&
         typeof exports.math_mode === "function" &&
         typeof exports.simd_enabled === "function" &&
@@ -141,7 +168,9 @@ export class InferenceEngine {
     const activations = this.wasm
       ? this.runWasm(model, input)
       : this.runJavaScript(model, input);
-    const probabilities = softmax(activations.at(-1) ?? []);
+    const probabilities = model.outputHead === "sigmoid"
+      ? sigmoidScores(activations.at(-1) ?? [])
+      : softmax(activations.at(-1) ?? []);
     activations[activations.length - 1] = probabilities;
     return {
       probabilities,
@@ -163,11 +192,39 @@ export class InferenceEngine {
     const layers: PreparedLayer[] = [];
     let memory = new Float32Array(this.wasm.memory.buffer);
 
-    const convolutions: PreparedConvolution[] = [];
-    const sourceConvolutions = modelConvolutions(model);
+    const spatialLayers: PreparedSpatialLayer[] = [];
+    const sourceSpatialLayers = modelSpatialLayers(model);
     for (let layerIndex = 0; layerIndex < model.layers.length; layerIndex++) {
-      for (const layer of sourceConvolutions.filter(({ position }) => position === layerIndex)) {
-        const outputSize = layer.outputWidth * layer.outputHeight * layer.filters;
+      for (const layer of sourceSpatialLayers.filter(({ position }) => position === layerIndex)) {
+        const outputSize = layer.outputWidth * layer.outputHeight * (layer.type === "conv" ? layer.filters : layer.inputChannels);
+        if (layer.type === "pool") {
+          const outputPtr = align(cursor);
+          cursor = outputPtr + outputSize * 4;
+          const indexPtr = align(cursor);
+          cursor = indexPtr + outputSize * 4;
+          if (cursor > this.wasm.memory.buffer.byteLength) {
+            this.wasm.memory.grow(Math.ceil((cursor - this.wasm.memory.buffer.byteLength) / 65536));
+            memory = new Float32Array(this.wasm.memory.buffer);
+          }
+          spatialLayers.push({
+            kind: "pool",
+            position: layer.position,
+            order: layer.order,
+            inputPtr: previousOutputPtr,
+            outputPtr,
+            indexPtr,
+            inputWidth: layer.inputWidth,
+            inputHeight: layer.inputHeight,
+            inputChannels: layer.inputChannels,
+            outputSize,
+            kernelSize: layer.kernelSize,
+            stride: layer.stride,
+            padding: layer.padding,
+            poolingKind: layer.kind === "max" ? 0 : layer.kind === "average" ? 1 : 2,
+          });
+          previousOutputPtr = outputPtr;
+          continue;
+        }
         const weightsPtr = align(cursor);
         cursor = weightsPtr + layer.weights.byteLength;
         const biasesPtr = align(cursor);
@@ -182,8 +239,10 @@ export class InferenceEngine {
         }
         memory.set(layer.weights, weightsPtr / 4);
         memory.set(layer.biases, biasesPtr / 4);
-        convolutions.push({
+        spatialLayers.push({
+          kind: "conv",
           position: layer.position,
+          order: layer.order,
           inputPtr: previousOutputPtr,
           weightsPtr,
           biasesPtr,
@@ -228,7 +287,7 @@ export class InferenceEngine {
       previousOutputPtr = outputPtr;
     }
 
-    const prepared = { inputPtr, convolutions, layers };
+    const prepared = { inputPtr, spatialLayers, layers };
     this.prepared.set(model, prepared);
     return prepared;
   }
@@ -241,8 +300,21 @@ export class InferenceEngine {
     const activations: number[][] = [];
 
     for (let layerIndex = 0; layerIndex < prepared.layers.length; layerIndex++) {
-      for (const layer of prepared.convolutions.filter(({ position }) => position === layerIndex)) {
-        this.wasm.conv2d_forward(
+      for (const layer of prepared.spatialLayers.filter(({ position }) => position === layerIndex)) {
+        if (layer.kind === "pool") {
+          this.wasm.pool2d_forward(
+            layer.inputPtr,
+            layer.outputPtr,
+            layer.indexPtr,
+            layer.inputWidth,
+            layer.inputHeight,
+            layer.inputChannels,
+            layer.kernelSize,
+            layer.stride,
+            layer.padding,
+            layer.poolingKind,
+          );
+        } else this.wasm.conv2d_forward(
           layer.inputPtr,
           layer.weightsPtr,
           layer.biasesPtr,
@@ -291,9 +363,38 @@ export class InferenceEngine {
   private runJavaScript(model: NeuralModel, input: Float32Array) {
     let current: ArrayLike<number> = input;
     const activations: number[][] = [];
-    const convolutions = modelConvolutions(model);
+    const spatialLayers = modelSpatialLayers(model);
     for (let layerIndex = 0; layerIndex < model.layers.length; layerIndex++) {
-      for (const layer of convolutions.filter(({ position }) => position === layerIndex)) {
+      for (const layer of spatialLayers.filter(({ position }) => position === layerIndex)) {
+        if (layer.type === "pool") {
+          const channels = layer.inputChannels;
+          const output = new Array<number>(layer.outputWidth * layer.outputHeight * channels).fill(0);
+          for (let channel = 0; channel < channels; channel++) {
+            for (let outputY = 0; outputY < layer.outputHeight; outputY++) {
+              for (let outputX = 0; outputX < layer.outputWidth; outputX++) {
+                let total = layer.kind === "max" ? -Infinity : 0;
+                let count = 0;
+                const kernelSize = layer.kind === "globalAverage" ? Math.max(layer.inputWidth, layer.inputHeight) : layer.kernelSize;
+                for (let kernelY = 0; kernelY < kernelSize; kernelY++) {
+                  const inputY = layer.kind === "globalAverage" ? kernelY : outputY * layer.stride + kernelY - layer.padding;
+                  if (inputY < 0 || inputY >= layer.inputHeight) continue;
+                  for (let kernelX = 0; kernelX < kernelSize; kernelX++) {
+                    const inputX = layer.kind === "globalAverage" ? kernelX : outputX * layer.stride + kernelX - layer.padding;
+                    if (inputX < 0 || inputX >= layer.inputWidth) continue;
+                    const value = current[channel * layer.inputWidth * layer.inputHeight + inputY * layer.inputWidth + inputX];
+                    total = layer.kind === "max" ? Math.max(total, value) : total + value;
+                    count++;
+                  }
+                }
+                output[channel * layer.outputWidth * layer.outputHeight + outputY * layer.outputWidth + outputX] =
+                  layer.kind === "max" ? (Number.isFinite(total) ? total : 0) : total / Math.max(1, count);
+              }
+            }
+          }
+          activations.push(output);
+          current = output;
+          continue;
+        }
         const output = new Array<number>(layer.outputWidth * layer.outputHeight * layer.filters);
         for (let filter = 0; filter < layer.filters; filter++) {
           for (let outputY = 0; outputY < layer.outputHeight; outputY++) {

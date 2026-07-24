@@ -3,6 +3,9 @@ import type {
   ConvolutionLayerData,
   HiddenLayer,
   NeuralModel,
+  PoolingConfig,
+  PoolingKind,
+  PoolingLayerData,
 } from "../types";
 
 export interface FeatureMapShape {
@@ -73,6 +76,10 @@ function convolutionId() {
   return `conv-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
 }
 
+function poolingId() {
+  return `pool-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
+}
+
 export function createDefaultConvolutionConfig(
   position = 0,
   enabled = false,
@@ -81,13 +88,32 @@ export function createDefaultConvolutionConfig(
   return {
     id: convolutionId(),
     enabled,
+    trainable: true,
     position,
+    order: 0,
     filters,
     kernelSize: 3,
     stride: 2,
     padding: 1,
     activation: "relu",
     kernels: Array.from({ length: filters }, (_, filter) => defaultKernel(filter)),
+  };
+}
+
+export function createDefaultPoolingConfig(
+  position = 0,
+  enabled = true,
+  order = 0,
+): PoolingConfig {
+  return {
+    id: poolingId(),
+    enabled,
+    position,
+    order,
+    kind: "max",
+    kernelSize: 2,
+    stride: 2,
+    padding: 0,
   };
 }
 
@@ -117,6 +143,16 @@ export interface ConvolutionPipelineEntry {
   input: FeatureMapShape;
   output: FeatureMapShape;
 }
+
+export interface PoolingPipelineEntry {
+  config: PoolingConfig;
+  input: FeatureMapShape;
+  output: FeatureMapShape;
+}
+
+export type SpatialPipelineEntry =
+  | ({ kind: "conv" } & ConvolutionPipelineEntry)
+  | ({ kind: "pool" } & PoolingPipelineEntry);
 
 export function fitConvolutionsToLayers(
   values: unknown,
@@ -153,27 +189,82 @@ export function fitConvolutionsToLayers(
 export function convolutionPipeline(
   layers: HiddenLayer[],
   convolutions: ConvolutionConfig[],
+  poolings: PoolingConfig[] = [],
 ): ConvolutionPipelineEntry[] {
-  const fitted = fitConvolutionsToLayers(convolutions, layers);
+  return spatialPipeline(layers, convolutions, poolings)
+    .filter((entry): entry is Extract<SpatialPipelineEntry, { kind: "conv" }> => entry.kind === "conv")
+    .map(({ config, input, output }) => ({ config, input, output }));
+}
+
+export function fitPoolingsToLayers(values: unknown, layers: HiddenLayer[]): PoolingConfig[] {
+  if (!Array.isArray(values)) return [];
+  return values
+    .map((value, index) => ({ config: normalizePoolingConfig(value), index }))
+    .filter(({ config }) => config.enabled)
+    .sort((left, right) =>
+      left.config.position - right.config.position ||
+      left.config.order - right.config.order ||
+      left.index - right.index
+    )
+    .map(({ config }) => ({
+      ...config,
+      enabled: true,
+      position: Math.min(layers.length, Math.max(0, config.position)),
+    }));
+}
+
+export function spatialPipeline(
+  layers: HiddenLayer[],
+  convolutions: ConvolutionConfig[],
+  poolings: PoolingConfig[] = [],
+): SpatialPipelineEntry[] {
+  const combined = [
+    ...fitConvolutionsToLayers(convolutions, layers).map((config, index) => ({
+      kind: "conv" as const,
+      config,
+      sourceIndex: index,
+    })),
+    ...fitPoolingsToLayers(poolings, layers).map((config, index) => ({
+      kind: "pool" as const,
+      config,
+      sourceIndex: index,
+    })),
+  ].sort((left, right) =>
+    left.config.position - right.config.position ||
+    left.config.order - right.config.order ||
+    (left.kind === right.kind ? left.sourceIndex - right.sourceIndex : left.kind === "conv" ? -1 : 1)
+  );
+
   let previousPosition = -1;
   let currentShape = inputImageShape;
-  return fitted.map((config) => {
-    if (config.position !== previousPosition) {
-      currentShape = convolutionInputShape(layers, config.position);
-      previousPosition = config.position;
+  return combined.map((entry) => {
+    if (entry.config.position !== previousPosition) {
+      currentShape = convolutionInputShape(layers, entry.config.position);
+      previousPosition = entry.config.position;
     }
     const input = currentShape;
-    const output = convolutionOutputShape(config, input);
+    if (entry.kind === "conv") {
+      const minimumPadding = Math.max(
+        0,
+        Math.ceil((entry.config.kernelSize - Math.min(input.width, input.height)) / 2),
+      );
+      const config = { ...entry.config, padding: Math.max(minimumPadding, entry.config.padding) };
+      const output = convolutionOutputShape(config, input);
+      currentShape = output;
+      return { kind: "conv", config, input, output };
+    }
+    const output = poolingOutputShape(entry.config, input);
     currentShape = output;
-    return { config, input, output };
+    return { kind: "pool", config: entry.config, input, output };
   });
 }
 
 export function architectureLayerSizes(
   layers: HiddenLayer[],
   convolutions: ConvolutionConfig[],
+  poolings: PoolingConfig[] = [],
 ) {
-  const pipeline = convolutionPipeline(layers, convolutions);
+  const pipeline = spatialPipeline(layers, convolutions, poolings);
   const sizes = [784];
   for (let position = 0; position <= layers.length; position++) {
     for (const entry of pipeline.filter(({ config }) => config.position === position)) {
@@ -189,6 +280,21 @@ export function modelConvolutions(model: NeuralModel | null | undefined): Convol
   if (!model) return [];
   if (Array.isArray(model.convolutions)) return model.convolutions;
   return model.convolution ? [model.convolution] : [];
+}
+
+export function modelPoolings(model: NeuralModel | null | undefined): PoolingLayerData[] {
+  return Array.isArray(model?.poolings) ? model.poolings : [];
+}
+
+export type ModelSpatialLayer =
+  | ({ type: "conv" } & ConvolutionLayerData)
+  | ({ type: "pool" } & PoolingLayerData);
+
+export function modelSpatialLayers(model: NeuralModel | null | undefined): ModelSpatialLayer[] {
+  return [
+    ...modelConvolutions(model).map((layer) => ({ type: "conv" as const, ...layer })),
+    ...modelPoolings(model).map((layer) => ({ type: "pool" as const, ...layer })),
+  ].sort((left, right) => left.position - right.position || left.order - right.order);
 }
 
 export function convolutionOutputShape(
@@ -208,6 +314,29 @@ export function convolutionOutputShape(
     height: safeHeight,
     channels: config.filters,
     length: safeWidth * safeHeight * config.filters,
+  };
+}
+
+export function poolingOutputShape(
+  config: PoolingConfig,
+  input: FeatureMapShape,
+): FeatureMapShape {
+  if (config.kind === "globalAverage") {
+    return { width: 1, height: 1, channels: input.channels, length: input.channels };
+  }
+  const width = Math.floor(
+    (input.width + config.padding * 2 - config.kernelSize) / config.stride,
+  ) + 1;
+  const height = Math.floor(
+    (input.height + config.padding * 2 - config.kernelSize) / config.stride,
+  ) + 1;
+  const safeWidth = Math.max(1, width);
+  const safeHeight = Math.max(1, height);
+  return {
+    width: safeWidth,
+    height: safeHeight,
+    channels: input.channels,
+    length: safeWidth * safeHeight * input.channels,
   };
 }
 
@@ -248,6 +377,8 @@ export function normalizeConvolutionConfig(value: unknown): ConvolutionConfig {
   const position = Number.isFinite(positionValue)
     ? Math.max(0, Math.floor(positionValue))
     : fallback.position;
+  const orderValue = Number(source.order);
+  const order = Number.isFinite(orderValue) ? Math.max(0, Math.floor(orderValue)) : fallback.order;
   const filtersValue = Number(source.filters);
   const filters = Number.isFinite(filtersValue)
     ? Math.min(32, Math.max(1, Math.floor(filtersValue)))
@@ -271,7 +402,9 @@ export function normalizeConvolutionConfig(value: unknown): ConvolutionConfig {
   return {
     id: typeof source.id === "string" && source.id ? source.id : fallback.id,
     enabled: source.enabled === true,
+    trainable: source.trainable !== false,
     position,
+    order,
     filters,
     kernelSize,
     stride,
@@ -281,5 +414,35 @@ export function normalizeConvolutionConfig(value: unknown): ConvolutionConfig {
       { length: filters },
       (_, filter) => resizedKernel(sourceKernels[filter], kernelSize, filter),
     ),
+  };
+}
+
+export function normalizePoolingConfig(value: unknown): PoolingConfig {
+  const fallback = createDefaultPoolingConfig();
+  if (!value || typeof value !== "object") return fallback;
+  const source = value as Partial<PoolingConfig>;
+  const positionValue = Number(source.position);
+  const orderValue = Number(source.order);
+  const kind: PoolingKind = ["max", "average", "globalAverage"].includes(String(source.kind))
+    ? source.kind as PoolingKind
+    : fallback.kind;
+  const kernelValue = Number(source.kernelSize);
+  const strideValue = Number(source.stride);
+  const paddingValue = Number(source.padding);
+  return {
+    id: typeof source.id === "string" && source.id ? source.id : fallback.id,
+    enabled: source.enabled !== false,
+    position: Number.isFinite(positionValue) ? Math.max(0, Math.floor(positionValue)) : fallback.position,
+    order: Number.isFinite(orderValue) ? Math.max(0, Math.floor(orderValue)) : fallback.order,
+    kind,
+    kernelSize: kind === "globalAverage"
+      ? 1
+      : [2, 3, 4].includes(kernelValue) ? kernelValue : fallback.kernelSize,
+    stride: kind === "globalAverage"
+      ? 1
+      : Number.isFinite(strideValue) ? Math.min(4, Math.max(1, Math.floor(strideValue))) : fallback.stride,
+    padding: kind === "globalAverage"
+      ? 0
+      : Number.isFinite(paddingValue) ? Math.min(3, Math.max(0, Math.floor(paddingValue))) : fallback.padding,
   };
 }

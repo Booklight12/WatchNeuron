@@ -19,8 +19,12 @@ import {
   convolutionPipeline,
   createDefaultConvolutionConfig,
   fitConvolutionsToLayers,
+  fitPoolingsToLayers,
   modelConvolutions,
+  modelPoolings,
   normalizeConvolutionConfig,
+  normalizePoolingConfig,
+  spatialPipeline,
 } from "./lib/convolution";
 import {
   deleteModelRecords,
@@ -37,6 +41,9 @@ import type {
   InferenceResult,
   NeuralModel,
   OptimizerConfig,
+  OutputHeadKind,
+  PoolingConfig,
+  PoolingLayerData,
   PropagationDirection,
   SavedModel,
   SavedModelSource,
@@ -60,17 +67,20 @@ const defaultOptimizer = (): OptimizerConfig => ({
   beta2: 0.999,
   decay: 0.9,
   epsilon: 1e-8,
+  weightDecay: 0,
 });
 
 const defaultScratchProfile = (): TrainingProfileSettings => ({
   epochs: 10,
   learningRate: 0.018,
+  batchSize: 16,
   optimizer: defaultOptimizer(),
 });
 
 const defaultFinetuneProfile = (): TrainingProfileSettings => ({
   epochs: 5,
   learningRate: 0.0002,
+  batchSize: 16,
   optimizer: { ...defaultOptimizer(), kind: "adam" },
 });
 
@@ -86,6 +96,7 @@ function normalizeTrainingProfile(
     : {} as Partial<OptimizerConfig>;
   const epochs = Number(source.epochs);
   const learningRate = Number(source.learningRate);
+  const batchSize = Number(source.batchSize);
   const kind = ["sgd", "momentum", "adam", "rmsprop", "adagrad"].includes(String(optimizer.kind))
     ? optimizer.kind as OptimizerConfig["kind"]
     : fallback.optimizer.kind;
@@ -94,6 +105,7 @@ function normalizeTrainingProfile(
     learningRate: Number.isFinite(learningRate) && learningRate > 0
       ? learningRate
       : fallback.learningRate,
+    batchSize: Number.isFinite(batchSize) ? Math.max(1, Math.floor(batchSize)) : fallback.batchSize,
     optimizer: {
       kind,
       momentum:
@@ -116,6 +128,10 @@ function normalizeTrainingProfile(
         Number.isFinite(optimizer.epsilon) && optimizer.epsilon! > 0
           ? optimizer.epsilon!
           : fallback.optimizer.epsilon,
+      weightDecay:
+        Number.isFinite(optimizer.weightDecay) && optimizer.weightDecay! >= 0
+          ? optimizer.weightDecay!
+          : fallback.optimizer.weightDecay,
     },
   };
 }
@@ -179,13 +195,28 @@ function storedConvolutions() {
   }
 }
 
+function storedPoolings() {
+  try {
+    const stored = JSON.parse(localStorage.getItem("watchneuron-poolings") ?? "[]");
+    return Array.isArray(stored) ? stored.map(normalizePoolingConfig) : [];
+  } catch {
+    return [];
+  }
+}
+
+function storedOutputHead(): OutputHeadKind {
+  return localStorage.getItem("watchneuron-output-head") === "sigmoid" ? "sigmoid" : "softmax";
+}
+
 function convolutionConfigFromLayer(layer: ConvolutionLayerData | null | undefined) {
   if (!layer) return createDefaultConvolutionConfig();
   const kernelLength = layer.kernelSize * layer.kernelSize;
   return normalizeConvolutionConfig({
     id: layer.id,
     enabled: true,
+    trainable: layer.trainable !== false,
     position: Number.isFinite(layer.position) ? layer.position : 0,
+    order: Number.isFinite(layer.order) ? layer.order : 0,
     filters: layer.filters,
     kernelSize: layer.kernelSize,
     stride: layer.stride,
@@ -200,6 +231,19 @@ function convolutionConfigFromLayer(layer: ConvolutionLayerData | null | undefin
   });
 }
 
+function poolingConfigFromLayer(layer: PoolingLayerData): PoolingConfig {
+  return normalizePoolingConfig({
+    id: layer.id,
+    enabled: true,
+    position: layer.position,
+    order: layer.order,
+    kind: layer.kind,
+    kernelSize: layer.kernelSize,
+    stride: layer.stride,
+    padding: layer.padding,
+  });
+}
+
 function convolutionConfigsFromRecord(record: SavedModel) {
   const configs = Array.isArray(record.convolutionConfigs)
     ? record.convolutionConfigs.map(normalizeConvolutionConfig)
@@ -209,11 +253,21 @@ function convolutionConfigsFromRecord(record: SavedModel) {
   return fitConvolutionsToLayers(configs, record.hiddenLayers);
 }
 
+function poolingConfigsFromRecord(record: SavedModel) {
+  const configs = Array.isArray(record.poolingConfigs)
+    ? record.poolingConfigs.map(normalizePoolingConfig)
+    : modelPoolings(record.model).map(poolingConfigFromLayer);
+  return fitPoolingsToLayers(configs, record.hiddenLayers);
+}
+
 function normalizeSavedModelRecord(record: SavedModel): SavedModel {
   const convolutionConfigs = convolutionConfigsFromRecord(record);
+  const poolingConfigs = poolingConfigsFromRecord(record);
   const convolutions = modelConvolutions(record.model).map((convolution, index) => ({
     ...convolution,
     id: convolution.id || convolutionConfigs[index]?.id || `conv-model-${index}`,
+    trainable: convolutionConfigs[index]?.trainable !== false,
+    order: Number.isFinite(convolution.order) ? convolution.order : convolutionConfigs[index]?.order ?? index,
   }));
   return {
     ...record,
@@ -222,9 +276,16 @@ function normalizeSavedModelRecord(record: SavedModel): SavedModel {
       dropout: Number.isFinite(layer.dropout) ? Math.min(0.95, Math.max(0, layer.dropout)) : 0,
     })),
     convolutionConfigs,
+    poolingConfigs,
+    outputHead: record.outputHead === "sigmoid" || record.model.outputHead === "sigmoid" ? "sigmoid" : "softmax",
     model: {
       ...record.model,
       convolutions,
+      poolings: modelPoolings(record.model).map((pooling, index) => ({
+        ...pooling,
+        order: Number.isFinite(pooling.order) ? pooling.order : poolingConfigs[index]?.order ?? index,
+      })),
+      outputHead: record.outputHead === "sigmoid" || record.model.outputHead === "sigmoid" ? "sigmoid" : "softmax",
     },
   };
 }
@@ -232,26 +293,51 @@ function normalizeSavedModelRecord(record: SavedModel): SavedModel {
 function architectureSignature(
   layers: HiddenLayer[],
   convolutionConfigs: ConvolutionConfig[],
+  poolingConfigs: PoolingConfig[],
+  head: OutputHeadKind,
 ) {
   return JSON.stringify({
     layers: layers.map(({ units, activation, dropout }) => ({ units, activation, dropout })),
     convolutions: convolutionConfigs
       .filter((config) => config.enabled)
-      .map(({ position, filters, kernelSize, stride, padding, activation, kernels }) => ({
+      .map(({ position, order, filters, kernelSize, stride, padding, activation, kernels, trainable }) => ({
         position,
+        order,
         filters,
         kernelSize,
         stride,
         padding,
         activation,
         kernels,
+        trainable,
       })),
+    poolings: poolingConfigs.map(({ position, order, kind, kernelSize, stride, padding }) => ({
+      position, order, kind, kernelSize, stride, padding,
+    })),
+    outputHead: head,
   });
 }
 
 function architectureMatchesRecord(record: SavedModel) {
-  return architectureSignature(hiddenLayers.value, convolutions.value) ===
-    architectureSignature(record.hiddenLayers, convolutionConfigsFromRecord(record));
+  return architectureSignature(hiddenLayers.value, convolutions.value, poolings.value, outputHead.value) ===
+    architectureSignature(
+      record.hiddenLayers,
+      convolutionConfigsFromRecord(record),
+      poolingConfigsFromRecord(record),
+      record.outputHead === "sigmoid" ? "sigmoid" : "softmax",
+    );
+}
+
+function trainabilityOnlyChanged(
+  configs: ConvolutionConfig[],
+  previous: ConvolutionConfig[] | undefined,
+) {
+  if (!previous || configs.length !== previous.length) return false;
+  const withoutTrainability = (values: ConvolutionConfig[]) => JSON.stringify(
+    values.map(({ trainable: _trainable, ...config }) => config),
+  );
+  return withoutTrainability(configs) === withoutTrainability(previous) &&
+    configs.some((config, index) => config.trainable !== previous[index].trainable);
 }
 
 function storedCustomSamples(): CustomDatasetSample[] {
@@ -313,12 +399,16 @@ const hadStoredArchitecture = [
   "watchneuron-architecture",
   "watchneuron-convolutions",
   "watchneuron-convolution",
+  "watchneuron-poolings",
+  "watchneuron-output-head",
 ].some((key) => localStorage.getItem(key) !== null);
 const initialHiddenLayers = storedLayers();
 const hiddenLayers = ref<HiddenLayer[]>(initialHiddenLayers);
 const convolutions = ref<ConvolutionConfig[]>(
   fitConvolutionsToLayers(storedConvolutions(), initialHiddenLayers),
 );
+const poolings = ref<PoolingConfig[]>(fitPoolingsToLayers(storedPoolings(), initialHiddenLayers));
+const outputHead = ref<OutputHeadKind>(storedOutputHead());
 const customSamples = ref<CustomDatasetSample[]>(storedCustomSamples());
 const mnistEnabled = ref(storedMnistEnabled());
 const savedModels = ref<SavedModel[]>([]);
@@ -356,7 +446,9 @@ const inference = shallowRef<InferenceResult>({
 });
 
 const generatedModel = computed(() =>
-  serialized.value ? buildModel(serialized.value, hiddenLayers.value, convolutions.value) : null,
+  serialized.value
+    ? buildModel(serialized.value, hiddenLayers.value, convolutions.value, poolings.value, outputHead.value)
+    : null,
 );
 const model = computed(() => trainedModel.value ?? generatedModel.value);
 const modelStatus = computed(() => {
@@ -376,20 +468,22 @@ const customTestCount = computed(
 const datasetLocked = computed(
   () => ["loading", "training", "paused"].includes(trainingProgress.value.phase),
 );
-const convolutionEntries = computed(() => convolutionPipeline(hiddenLayers.value, convolutions.value));
-const layerSizes = computed(() => architectureLayerSizes(hiddenLayers.value, convolutions.value));
+const convolutionEntries = computed(() => convolutionPipeline(hiddenLayers.value, convolutions.value, poolings.value));
+const spatialEntries = computed(() => spatialPipeline(hiddenLayers.value, convolutions.value, poolings.value));
+const layerSizes = computed(() => architectureLayerSizes(hiddenLayers.value, convolutions.value, poolings.value));
 const layerNames = computed(() => {
   const names = ["输入层"];
   for (let position = 0; position <= hiddenLayers.value.length; position++) {
-    for (const { config } of convolutionEntries.value.filter((entry) => entry.config.position === position)) {
-      names.push(`卷积层 · ${config.filters} 核 · ${activationLabels[config.activation]}`);
+    for (const entry of spatialEntries.value.filter((entry) => entry.config.position === position)) {
+      if (entry.kind === "conv") names.push(`卷积层 · ${entry.config.filters} 核 · ${activationLabels[entry.config.activation]}`);
+      else names.push(entry.config.kind === "globalAverage" ? "全局平均池化 · GAP" : `${entry.config.kind === "max" ? "最大" : "平均"}池化层`);
     }
     if (position < hiddenLayers.value.length) {
       const layer = hiddenLayers.value[position];
       names.push(`隐藏层 ${position + 1} · ${activationLabels[layer.activation]}`);
     }
   }
-  names.push("输出层 · Softmax");
+  names.push(`输出层 · ${outputHead.value === "sigmoid" ? "Sigmoid" : "Softmax"}`);
   return names;
 });
 const trainingFlowActive = computed(
@@ -543,11 +637,13 @@ function cloneNeuralModel(model: NeuralModel): NeuralModel {
   return {
     calibrated: model.calibrated,
     trained: model.trained,
+    outputHead: model.outputHead === "sigmoid" ? "sigmoid" : "softmax",
     convolutions: modelConvolutions(model).map((convolution) => ({
       ...convolution,
       weights: Float32Array.from(convolution.weights),
       biases: Float32Array.from(convolution.biases),
     })),
+    poolings: modelPoolings(model).map((pooling) => ({ ...pooling })),
     layers: model.layers.map((layer) => ({
       ...layer,
       weights: Float32Array.from(layer.weights),
@@ -562,6 +658,10 @@ async function applySavedModel(record: SavedModel) {
     dropout: Number.isFinite(layer.dropout) ? Math.min(0.95, Math.max(0, layer.dropout)) : 0,
   }));
   convolutions.value = convolutionConfigsFromRecord(record);
+  poolings.value = poolingConfigsFromRecord(record);
+  outputHead.value = record.outputHead === "sigmoid" || record.model.outputHead === "sigmoid"
+    ? "sigmoid"
+    : "softmax";
   await nextTick();
   trainedModel.value = cloneNeuralModel(record.model);
   trainedEpochCount.value = Math.max(0, Math.floor(record.progress.epoch));
@@ -617,6 +717,8 @@ async function persistTrainingModel(
       ...convolution,
       kernels: convolution.kernels.map((kernel) => [...kernel]),
     })),
+    poolingConfigs: poolings.value.map((pooling) => ({ ...pooling })),
+    outputHead: outputHead.value,
     model,
     progress: { ...progress },
   };
@@ -705,15 +807,35 @@ function updateLayers(layers: HiddenLayer[]) {
           : convolution.position,
       }));
   convolutions.value = fitConvolutionsToLayers(shifted, layers);
+  const shiftedPoolings = removedIndex < 0
+    ? poolings.value
+    : poolings.value.map((pooling) => ({
+        ...pooling,
+        position: pooling.position > removedIndex ? pooling.position - 1 : pooling.position,
+      }));
+  poolings.value = fitPoolingsToLayers(shiftedPoolings, layers);
 }
 
 function updateConvolutions(configs: ConvolutionConfig[]) {
   convolutions.value = fitConvolutionsToLayers(configs, hiddenLayers.value);
 }
 
-function reorderArchitecture(layers: HiddenLayer[], configs: ConvolutionConfig[]) {
+function updatePoolings(configs: PoolingConfig[]) {
+  poolings.value = fitPoolingsToLayers(configs, hiddenLayers.value);
+}
+
+function reorderArchitecture(
+  layers: HiddenLayer[],
+  configs: ConvolutionConfig[],
+  poolingConfigs: PoolingConfig[],
+) {
   hiddenLayers.value = layers;
   convolutions.value = fitConvolutionsToLayers(configs, layers);
+  poolings.value = fitPoolingsToLayers(poolingConfigs, layers);
+}
+
+function updateOutputHead(head: OutputHeadKind) {
+  outputHead.value = head === "sigmoid" ? "sigmoid" : "softmax";
 }
 
 function updateTrainingSettings(mode: TrainingMode, settings: TrainingSettings) {
@@ -769,6 +891,12 @@ function startTraining(mode: TrainingMode = "scratch") {
       trainingTrace.value = {
         activations: message.activations.map((layer: ArrayLike<number>) => Array.from(layer)),
         gradients: message.gradients.map((layer: ArrayLike<number>) => Array.from(layer)),
+        convolutionWeights: (message.convolutionWeights ?? []).map(
+          (weights: ArrayLike<number>) => Array.from(weights),
+        ),
+        convolutionBiases: (message.convolutionBiases ?? []).map(
+          (biases: ArrayLike<number>) => Array.from(biases),
+        ),
         epoch: message.epoch,
         sample: message.sample,
         samples: message.samples,
@@ -876,6 +1004,8 @@ function startTraining(mode: TrainingMode = "scratch") {
         ...convolution,
         kernels: convolution.kernels.map((kernel) => [...kernel]),
       })),
+      poolings: poolings.value.map((pooling) => ({ ...pooling })),
+      outputHead: outputHead.value,
       settings,
       initialModel,
       customSamples: customSamples.value.map((sample) => ({
@@ -942,6 +1072,8 @@ async function resetArchitecture() {
   trainedModelAccuracy.value = null;
   hiddenLayers.value = defaultLayers();
   convolutions.value = [];
+  poolings.value = [];
+  outputHead.value = "softmax";
   selectedLayer.value = 1;
 }
 
@@ -970,12 +1102,22 @@ watch(
 
 watch(
   convolutions,
-  (configs) => {
+  (configs, previous) => {
+    const preservesLoadedModel = trainabilityOnlyChanged(configs, previous);
     if (trainingWorker) cancelTraining();
     trainingTrace.value = null;
-    trainedModel.value = null;
-    trainedEpochCount.value = 0;
-    trainedModelAccuracy.value = null;
+    if (preservesLoadedModel && trainedModel.value) {
+      const currentModel = cloneNeuralModel(trainedModel.value);
+      currentModel.convolutions = modelConvolutions(currentModel).map((convolution) => ({
+        ...convolution,
+        trainable: configs.find((config) => config.id === convolution.id)?.trainable !== false,
+      }));
+      trainedModel.value = currentModel;
+    } else if (!preservesLoadedModel) {
+      trainedModel.value = null;
+      trainedEpochCount.value = 0;
+      trainedModelAccuracy.value = null;
+    }
     trainingProgress.value = {
       phase: "idle",
       epoch: 0,
@@ -990,6 +1132,39 @@ watch(
   },
   { deep: true },
 );
+
+watch(
+  poolings,
+  (configs) => {
+    if (trainingWorker) cancelTraining();
+    trainingTrace.value = null;
+    trainedModel.value = null;
+    trainedEpochCount.value = 0;
+    trainedModelAccuracy.value = null;
+    trainingProgress.value = {
+      phase: "idle",
+      epoch: 0,
+      epochs: trainingProfiles.value.scratch.epochs,
+      accuracy: 0,
+      loss: 0,
+      elapsedMs: 0,
+    };
+    localStorage.setItem("watchneuron-poolings", JSON.stringify(configs));
+    selectedLayer.value = Math.min(selectedLayer.value, layerSizes.value.length - 1);
+    nextTick(runInference);
+  },
+  { deep: true },
+);
+
+watch(outputHead, (head) => {
+  if (trainingWorker) cancelTraining();
+  trainingTrace.value = null;
+  trainedModel.value = null;
+  trainedEpochCount.value = 0;
+  trainedModelAccuracy.value = null;
+  localStorage.setItem("watchneuron-output-head", head);
+  nextTick(runInference);
+});
 
 watch(
   customSamples,
@@ -1238,9 +1413,12 @@ onBeforeUnmount(() => {
           <NetworkCanvas
             :layers="hiddenLayers"
             :convolutions="convolutions"
+            :poolings="poolings"
+            :output-head="outputHead"
             :activations="flowActivations"
             :gradients="flowGradients"
             :model="model"
+            :trace="trainingTrace"
             :selected-layer="selectedLayer"
             :animated="animated"
             :training="trainingFlowActive"
@@ -1291,6 +1469,7 @@ onBeforeUnmount(() => {
       <aside class="control-column">
         <PredictionPanel
           :probabilities="displayedProbabilities"
+          :output-head="outputHead"
           :status="modelStatus"
           :has-input="
             (trainingFlowActive || inputEnergy >= 0.001) &&
@@ -1301,15 +1480,20 @@ onBeforeUnmount(() => {
         <ArchitectureEditor
           :layers="hiddenLayers"
           :convolutions="convolutions"
+          :poolings="poolings"
+          :output-head="outputHead"
           :parameter-count="parameterCount"
           @update="updateLayers"
           @update-convolutions="updateConvolutions"
+          @update-poolings="updatePoolings"
+          @update-output-head="updateOutputHead"
           @reorder="reorderArchitecture"
           @reset="resetArchitecture"
         />
         <TrainingPanel
           :layers="hiddenLayers"
           :convolutions="convolutions"
+          :poolings="poolings"
           :backend="engineBackend"
           :profiles="trainingProfiles"
           :progress="trainingProgress"
@@ -1336,6 +1520,8 @@ onBeforeUnmount(() => {
       v-if="activeView === 'signals'"
       :layers="hiddenLayers"
       :convolutions="convolutions"
+      :poolings="poolings"
+      :output-head="outputHead"
       :model="model"
       :activations="flowActivations"
       :gradients="flowGradients"

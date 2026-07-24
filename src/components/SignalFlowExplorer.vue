@@ -14,15 +14,18 @@ import {
 } from "@lucide/vue";
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, watch } from "vue";
 import { activationLabels } from "../lib/model";
-import { convolutionPipeline, modelConvolutions } from "../lib/convolution";
+import { convolutionPipeline, modelConvolutions, spatialPipeline } from "../lib/convolution";
 import type {
   ConvolutionConfig,
   HiddenLayer,
   NeuralModel,
+  OutputHeadKind,
+  PoolingConfig,
   TrainingProgress,
   TrainingTrace,
 } from "../types";
 import SignalMap from "./SignalMap.vue";
+import KernelMatrixView from "./KernelMatrixView.vue";
 
 interface MapShape {
   width: number;
@@ -32,13 +35,14 @@ interface MapShape {
 
 interface LayerDescriptor {
   index: number;
-  kind: "input" | "conv" | "dense" | "output";
+  kind: "input" | "conv" | "pool" | "dense" | "output";
   code: string;
   name: string;
   activation: string;
   count: number;
   shape?: MapShape;
   convolutionIndex?: number;
+  spatialIndex?: number;
   denseIndex?: number;
 }
 
@@ -57,6 +61,14 @@ interface SignalMapSelection {
   clientY: number;
 }
 
+interface KernelSnapshot {
+  weights: number[];
+  inputChannels: number;
+  kernelSize: number;
+  filter: number;
+  trainable: boolean;
+}
+
 interface FrozenMeta {
   capturedAt: number;
   training: boolean;
@@ -66,6 +78,8 @@ interface FrozenMeta {
 const props = defineProps<{
   layers: HiddenLayer[];
   convolutions: ConvolutionConfig[];
+  poolings: PoolingConfig[];
+  outputHead: OutputHeadKind;
   model: NeuralModel | null;
   activations: number[][];
   gradients: number[][];
@@ -95,7 +109,8 @@ const selection = ref<Selection>({
   neuronIndex: 0,
 });
 
-const convolutionEntries = computed(() => convolutionPipeline(props.layers, props.convolutions));
+const convolutionEntries = computed(() => convolutionPipeline(props.layers, props.convolutions, props.poolings));
+const spatialEntries = computed(() => spatialPipeline(props.layers, props.convolutions, props.poolings));
 const layerDescriptors = computed<LayerDescriptor[]>(() => {
   const result: LayerDescriptor[] = [
     {
@@ -109,9 +124,11 @@ const layerDescriptors = computed<LayerDescriptor[]>(() => {
     },
   ];
   for (let position = 0; position <= props.layers.length; position++) {
-    for (const entry of convolutionEntries.value.filter(({ config }) => config.position === position)) {
-      const convolutionIndex = convolutionEntries.value.indexOf(entry);
-      result.push({
+    for (const entry of spatialEntries.value.filter(({ config }) => config.position === position)) {
+      const spatialIndex = spatialEntries.value.indexOf(entry);
+      if (entry.kind === "conv") {
+        const convolutionIndex = convolutionEntries.value.findIndex(({ config }) => config.id === entry.config.id);
+        result.push({
         index: result.length,
         kind: "conv",
         code: `CONV2D ${convolutionIndex + 1}`,
@@ -124,6 +141,17 @@ const layerDescriptors = computed<LayerDescriptor[]>(() => {
           channels: entry.output.channels,
         },
         convolutionIndex,
+        spatialIndex,
+      });
+      } else result.push({
+        index: result.length,
+        kind: "pool",
+        code: entry.config.kind === "globalAverage" ? "GAP" : entry.config.kind === "max" ? "MAXPOOL2D" : "AVGPOOL2D",
+        name: entry.config.kind === "globalAverage" ? "全局平均池化" : entry.config.kind === "max" ? "最大池化层" : "平均池化层",
+        activation: "无参数聚合",
+        count: entry.output.length,
+        shape: { width: entry.output.width, height: entry.output.height, channels: entry.output.channels },
+        spatialIndex,
       });
     }
     if (position < props.layers.length) {
@@ -144,7 +172,7 @@ const layerDescriptors = computed<LayerDescriptor[]>(() => {
     kind: "output",
     code: "OUTPUT",
     name: "输出层",
-    activation: "Softmax",
+      activation: props.outputHead === "sigmoid" ? "Sigmoid + BCE" : "Softmax + CE",
     count: 10,
     denseIndex: props.layers.length,
   });
@@ -232,6 +260,8 @@ function captureSnapshot() {
         label: props.trace.label,
         prediction: props.trace.prediction,
         loss: props.trace.loss,
+        convolutionWeights: props.trace.convolutionWeights.map((weights) => [...weights]),
+        convolutionBiases: props.trace.convolutionBiases.map((biases) => [...biases]),
       }
     : null;
   frozenMeta.value = { capturedAt: Date.now(), training: props.training, trace };
@@ -371,9 +401,16 @@ const neuronDetails = computed(() => {
     const filter = Math.floor(index / mapSize);
     const position = index % mapSize;
     const convolution = modelConvolutions(props.model)[descriptor.convolutionIndex ?? 0];
+    const convolutionConfig = convolutionEntries.value[descriptor.convolutionIndex ?? 0]?.config;
+    const weightsSource = displayingTraining.value
+      ? currentTrace.value?.convolutionWeights[descriptor.convolutionIndex ?? 0] ?? convolution?.weights
+      : convolution?.weights;
+    const biasesSource = displayingTraining.value
+      ? currentTrace.value?.convolutionBiases[descriptor.convolutionIndex ?? 0] ?? convolution?.biases
+      : convolution?.biases;
     const kernelLength = (convolution?.inputChannels ?? 1) * (convolution?.kernelSize ?? 1) ** 2;
     const start = filter * kernelLength;
-    const weights = convolution?.weights.subarray(start, start + kernelLength) ?? [];
+    const weights = Array.from(weightsSource ?? []).slice(start, start + kernelLength);
     let absoluteSum = 0;
     let squaredSum = 0;
     for (const weight of weights) {
@@ -386,12 +423,29 @@ const neuronDetails = computed(() => {
         label: "特征坐标",
         value: `行 ${Math.floor(position / shape.width) + 1} · 列 ${(position % shape.width) + 1}`,
       },
-      { label: "卷积偏置", value: formatValue(convolution?.biases[filter] ?? 0) },
+      { label: "卷积偏置", value: formatValue(biasesSource?.[filter] ?? 0) },
+      { label: "参数状态", value: convolutionConfig?.trainable === false ? "已冻结" : "参与训练" },
       {
         label: "核权重绝对均值",
         value: formatValue(weights.length ? absoluteSum / weights.length : 0),
       },
       { label: "核权重 L2", value: formatValue(Math.sqrt(squaredSum)) },
+    );
+    return details;
+  }
+
+  if (descriptor.kind === "pool") {
+    const entry = spatialEntries.value[descriptor.spatialIndex ?? 0];
+    if (!entry || entry.kind !== "pool") return details;
+    const shape = descriptor.shape!;
+    const mapSize = shape.width * shape.height;
+    const channel = Math.floor(index / mapSize);
+    const position = index % mapSize;
+    details.push(
+      { label: "通道", value: `${channel + 1} / ${shape.channels}` },
+      { label: "输出坐标", value: `行 ${Math.floor(position / shape.width) + 1} · 列 ${(position % shape.width) + 1}` },
+      { label: "聚合方式", value: entry?.config.kind === "globalAverage" ? "全局平均" : entry?.config.kind === "max" ? "窗口最大值" : "窗口平均值" },
+      { label: "可训练参数", value: "无" },
     );
     return details;
   }
@@ -421,6 +475,27 @@ const neuronDetails = computed(() => {
     { label: "权重 L2", value: formatValue(Math.sqrt(squaredSum)) },
   );
   return details;
+});
+
+const selectedKernel = computed<KernelSnapshot | null>(() => {
+  const descriptor = selectedDescriptor.value;
+  if (descriptor.kind !== "conv") return null;
+  const convolutionIndex = descriptor.convolutionIndex ?? 0;
+  const config = convolutionEntries.value[convolutionIndex]?.config;
+  const convolution = modelConvolutions(props.model)[convolutionIndex];
+  if (!config || !convolution) return null;
+  const shape = descriptor.shape!;
+  const filter = Math.floor(selection.value.neuronIndex / (shape.width * shape.height));
+  const weights = displayingTraining.value
+    ? currentTrace.value?.convolutionWeights[convolutionIndex] ?? convolution.weights
+    : convolution.weights;
+  return {
+    weights: Array.from(weights),
+    inputChannels: convolution.inputChannels,
+    kernelSize: convolution.kernelSize,
+    filter,
+    trainable: config.trainable,
+  };
 });
 
 const selectionContext = computed(() => {
@@ -644,6 +719,15 @@ onBeforeUnmount(() => {
                 <dd>{{ detail.value }}</dd>
               </div>
             </dl>
+
+            <KernelMatrixView
+              v-if="selectedKernel"
+              :weights="selectedKernel.weights"
+              :input-channels="selectedKernel.inputChannels"
+              :kernel-size="selectedKernel.kernelSize"
+              :filter="selectedKernel.filter"
+              :trainable="selectedKernel.trainable"
+            />
 
             <footer>
               <span>{{ viewerPaused ? "FROZEN FRAME" : "LIVE FRAME" }}</span>

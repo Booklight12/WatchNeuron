@@ -15,24 +15,39 @@ import { type CSSProperties, computed, nextTick, onBeforeUnmount, onMounted, ref
 import ActivationGuide, { type ActivationGuideKind } from "./ActivationGuide.vue";
 import AppSelect, { type AppSelectOption } from "./AppSelect.vue";
 import ConvolutionEditor from "./ConvolutionEditor.vue";
-import type { ActivationKind, ConvolutionConfig, HiddenLayer } from "../types";
+import PoolingEditor from "./PoolingEditor.vue";
+import SegmentedControl, { type SegmentedControlOption } from "./SegmentedControl.vue";
+import type {
+  ActivationKind,
+  ConvolutionConfig,
+  HiddenLayer,
+  OutputHeadKind,
+  PoolingConfig,
+} from "../types";
 import {
-  convolutionPipeline,
   createDefaultConvolutionConfig,
+  createDefaultPoolingConfig,
   fitConvolutionsToLayers,
+  fitPoolingsToLayers,
+  spatialPipeline,
+  type FeatureMapShape,
 } from "../lib/convolution";
 import { activationLabels } from "../lib/model";
 
 const props = defineProps<{
   layers: HiddenLayer[];
   convolutions: ConvolutionConfig[];
+  poolings: PoolingConfig[];
+  outputHead: OutputHeadKind;
   parameterCount: number;
 }>();
 
 const emit = defineEmits<{
   update: [layers: HiddenLayer[]];
   updateConvolutions: [configs: ConvolutionConfig[]];
-  reorder: [layers: HiddenLayer[], configs: ConvolutionConfig[]];
+  updatePoolings: [configs: PoolingConfig[]];
+  updateOutputHead: [head: OutputHeadKind];
+  reorder: [layers: HiddenLayer[], configs: ConvolutionConfig[], poolings: PoolingConfig[]];
   reset: [];
 }>();
 
@@ -43,6 +58,14 @@ const activationSelectOptions: AppSelectOption[] = activationOptions.map(([value
 }));
 const guideKind = ref<ActivationGuideKind>("relu");
 const descriptionMode = ref<"brief" | "detailed">("brief");
+const descriptionModeOptions: SegmentedControlOption[] = [
+  { value: "brief", label: "简述" },
+  { value: "detailed", label: "详细" },
+];
+const outputHeadOptions: SegmentedControlOption[] = [
+  { value: "softmax", label: "Softmax" },
+  { value: "sigmoid", label: "Sigmoid" },
+];
 const copyState = ref<"idle" | "copied" | "error">("idle");
 const addMenuOpen = ref(false);
 const addMenu = ref<HTMLElement | null>(null);
@@ -59,29 +82,37 @@ let dragPreviewY = -160;
 let dragPreviewTargetX = -320;
 let dragPreviewTargetY = -160;
 
-const convolutionEntries = computed(() => convolutionPipeline(props.layers, props.convolutions));
+const spatialEntries = computed(() => spatialPipeline(props.layers, props.convolutions, props.poolings));
 type OrderedLayer =
   | { kind: "dense"; key: string; denseIndex: number; layer: HiddenLayer; displayIndex: number }
   | {
       kind: "conv";
       key: string;
       config: ConvolutionConfig;
-      input: (typeof convolutionEntries.value)[number]["input"];
-      output: (typeof convolutionEntries.value)[number]["output"];
+      input: FeatureMapShape;
+      output: FeatureMapShape;
+      displayIndex: number;
+    }
+  | {
+      kind: "pool";
+      key: string;
+      config: PoolingConfig;
+      input: (typeof spatialEntries.value)[number]["input"];
+      output: (typeof spatialEntries.value)[number]["output"];
       displayIndex: number;
     };
 
 const orderedLayers = computed(() => {
   const result: OrderedLayer[] = [];
   for (let position = 0; position <= props.layers.length; position++) {
-    for (const entry of convolutionEntries.value.filter(({ config }) => config.position === position)) {
-      result.push({
-        kind: "conv",
-        key: entry.config.id,
-        config: entry.config,
-        input: entry.input,
-        output: entry.output,
-        displayIndex: result.length + 1,
+    for (const entry of spatialEntries.value.filter(({ config }) => config.position === position)) {
+      if (entry.kind === "conv") result.push({
+        kind: "conv", key: entry.config.id, config: entry.config, input: entry.input,
+        output: entry.output, displayIndex: result.length + 1,
+      });
+      else result.push({
+        kind: "pool", key: entry.config.id, config: entry.config, input: entry.input,
+        output: entry.output, displayIndex: result.length + 1,
       });
     }
     if (position < props.layers.length) {
@@ -113,16 +144,15 @@ const dragTargetIndex = computed(() => {
 const dragPreview = computed(() => {
   const item = orderedLayers.value.find((candidate) => candidate.key === draggedLayerKey.value);
   if (!item) return null;
-  return item.kind === "dense"
-    ? {
+  if (item.kind === "dense") return {
         kind: item.kind,
         type: "DENSE",
         name: "全连接层",
         detail: `${item.layer.units.toLocaleString("zh-CN")} 神经元 · ${activationLabels[item.layer.activation]}`,
         from: item.displayIndex,
         to: dragTargetIndex.value + 1,
-      }
-    : {
+      };
+  if (item.kind === "conv") return {
         kind: item.kind,
         type: "CONV2D",
         name: "二维卷积层",
@@ -130,6 +160,14 @@ const dragPreview = computed(() => {
         from: item.displayIndex,
         to: dragTargetIndex.value + 1,
       };
+  return {
+    kind: item.kind,
+    type: item.config.kind === "globalAverage" ? "GAP" : item.config.kind === "max" ? "MAXPOOL2D" : "AVGPOOL2D",
+    name: item.config.kind === "globalAverage" ? "全局平均池化" : item.config.kind === "max" ? "最大池化层" : "平均池化层",
+    detail: item.config.kind === "globalAverage" ? `${item.input.width}×${item.input.height} → 1×1` : `${item.config.kernelSize}×${item.config.kernelSize} · stride ${item.config.stride}`,
+    from: item.displayIndex,
+    to: dragTargetIndex.value + 1,
+  };
 });
 
 function describeNetwork(mode: "brief" | "detailed") {
@@ -144,7 +182,18 @@ function describeNetwork(mode: "brief" | "detailed") {
       briefLayers.push(`Conv2D（${item.config.filters} 个 ${item.config.kernelSize}×${item.config.kernelSize} 卷积核）`);
       structure.push(item.output.length);
       layerDescriptions.push(
-        `第 ${layerNumber++} 层：二维卷积层，将 ${item.input.width}×${item.input.height}×${item.input.channels} 输入映射为 ${item.output.width}×${item.output.height}×${item.config.filters}，使用 ${item.config.filters} 个 ${item.config.kernelSize}×${item.config.kernelSize} 可训练卷积核，步幅 ${item.config.stride}，填充 ${item.config.padding}，激活函数为 ${activationLabels[item.config.activation]}。`,
+        `第 ${layerNumber++} 层：二维卷积层，将 ${item.input.width}×${item.input.height}×${item.input.channels} 输入映射为 ${item.output.width}×${item.output.height}×${item.config.filters}，使用 ${item.config.filters} 个 ${item.config.kernelSize}×${item.config.kernelSize} 卷积核，步幅 ${item.config.stride}，填充 ${item.config.padding}，激活函数为 ${activationLabels[item.config.activation]}，参数${item.config.trainable ? "参与反向传播更新" : "已冻结但仍传递输入梯度"}。`,
+      );
+      continue;
+    }
+    if (item.kind === "pool") {
+      const name = item.config.kind === "globalAverage"
+        ? "GAP"
+        : item.config.kind === "max" ? "MaxPool2D" : "AvgPool2D";
+      briefLayers.push(name);
+      structure.push(item.output.length);
+      layerDescriptions.push(
+        `第 ${layerNumber++} 层：${name} 池化层，将 ${item.input.width}×${item.input.height}×${item.input.channels} 映射为 ${item.output.width}×${item.output.height}×${item.output.channels}，不包含可训练参数。`,
       );
       continue;
     }
@@ -154,12 +203,12 @@ function describeNetwork(mode: "brief" | "detailed") {
       `第 ${layerNumber++} 层：全连接隐藏层，${item.layer.units} 个神经元，使用 ${activationLabels[item.layer.activation]} 激活，Dropout ${Math.round(item.layer.dropout * 100)}%。`,
     );
   }
-  briefLayers.push("Softmax 输出层");
+  briefLayers.push(`${props.outputHead === "sigmoid" ? "Sigmoid" : "Softmax"} 输出层`);
   structure.push(10);
   if (mode === "brief") return `${totalLayers} 层神经网络：${briefLayers.join(" → ")}。`;
-  layerDescriptions.push(`第 ${totalLayers} 层：全连接输出层，10 个神经元，使用 Softmax 激活。`);
+  layerDescriptions.push(`第 ${totalLayers} 层：全连接输出层，10 个神经元，使用 ${props.outputHead === "sigmoid" ? "Sigmoid 独立分数与二元交叉熵" : "Softmax 概率与分类交叉熵"}。`);
   return [
-    `神经网络共 ${totalLayers} 层，连接结构为 ${structure.join(" → ")}，共有 ${props.parameterCount.toLocaleString("zh-CN")} 个可训练参数。`,
+    `神经网络共 ${totalLayers} 层，连接结构为 ${structure.join(" → ")}，共有 ${props.parameterCount.toLocaleString("zh-CN")} 个模型参数。`,
     ...layerDescriptions,
   ].join("\n");
 }
@@ -261,7 +310,18 @@ function addDenseLayer() {
 
 function addConvolutionLayer() {
   const next = createDefaultConvolutionConfig(props.layers.length, true);
+  next.order = Math.max(-1, ...[...props.convolutions, ...props.poolings].map((item) => item.order)) + 1;
   emit("updateConvolutions", fitConvolutionsToLayers([...props.convolutions, next], props.layers));
+  addMenuOpen.value = false;
+}
+
+function addPoolingLayer() {
+  const next = createDefaultPoolingConfig(
+    props.layers.length,
+    true,
+    Math.max(-1, ...[...props.convolutions, ...props.poolings].map((item) => item.order)) + 1,
+  );
+  emit("updatePoolings", fitPoolingsToLayers([...props.poolings, next], props.layers));
   addMenuOpen.value = false;
 }
 
@@ -277,6 +337,17 @@ function updateConvolution(config: ConvolutionConfig) {
 
 function removeConvolution(id: string) {
   emit("updateConvolutions", props.convolutions.filter((config) => config.id !== id));
+}
+
+function updatePooling(config: PoolingConfig) {
+  emit("updatePoolings", fitPoolingsToLayers(
+    props.poolings.map((candidate) => candidate.id === config.id ? config : candidate),
+    props.layers,
+  ));
+}
+
+function removePooling(id: string) {
+  emit("updatePoolings", props.poolings.filter((config) => config.id !== id));
 }
 
 function removeLayer(id: string) {
@@ -298,7 +369,7 @@ function setDropout(id: string, input: HTMLInputElement) {
 function layerName(item: OrderedLayer) {
   return item.kind === "dense"
     ? `全连接层 ${item.denseIndex + 1}`
-    : "二维卷积层";
+    : item.kind === "conv" ? "二维卷积层" : "池化层";
 }
 
 function emitReorderedLayers(items: OrderedLayer[], movedKey: string) {
@@ -306,15 +377,25 @@ function emitReorderedLayers(items: OrderedLayer[], movedKey: string) {
     .filter((item): item is Extract<OrderedLayer, { kind: "dense" }> => item.kind === "dense")
     .map((item) => item.layer);
   const convolutions: ConvolutionConfig[] = [];
+  const poolings: PoolingConfig[] = [];
   let densePosition = 0;
+  let spatialOrder = 0;
   for (const item of items) {
     if (item.kind === "dense") {
       densePosition++;
+      spatialOrder = 0;
+    } else if (item.kind === "conv") {
+      convolutions.push({ ...item.config, position: densePosition, order: spatialOrder++ });
     } else {
-      convolutions.push({ ...item.config, position: densePosition });
+      poolings.push({ ...item.config, position: densePosition, order: spatialOrder++ });
     }
   }
-  emit("reorder", layers, fitConvolutionsToLayers(convolutions, layers));
+  emit(
+    "reorder",
+    layers,
+    fitConvolutionsToLayers(convolutions, layers),
+    fitPoolingsToLayers(poolings, layers),
+  );
   const index = items.findIndex((item) => item.key === movedKey);
   const moved = items[index];
   reorderAnnouncement.value = moved
@@ -449,10 +530,12 @@ function handlePointerCancel() {
         <h2 id="architecture-heading">网络结构</h2>
       </div>
       <div class="architecture-heading-actions">
-        <div class="description-mode" role="group" aria-label="网络描述详细程度">
-          <button type="button" :aria-pressed="descriptionMode === 'brief'" :class="{ active: descriptionMode === 'brief' }" @click="descriptionMode = 'brief'">简述</button>
-          <button type="button" :aria-pressed="descriptionMode === 'detailed'" :class="{ active: descriptionMode === 'detailed' }" @click="descriptionMode = 'detailed'">详细</button>
-        </div>
+        <SegmentedControl
+          v-model="descriptionMode"
+          class="description-mode"
+          :options="descriptionModeOptions"
+          label="网络描述详细程度"
+        />
         <button
           class="icon-button copy-description-button"
           type="button"
@@ -512,6 +595,30 @@ function handlePointerCancel() {
           </template>
         </ConvolutionEditor>
 
+        <PoolingEditor
+          v-else-if="item.kind === 'pool'"
+          :config="item.config"
+          :input="item.input"
+          :display-index="item.displayIndex"
+          @update="updatePooling"
+          @remove="removePooling(item.config.id)"
+        >
+          <template #drag-handle>
+            <button
+              class="layer-drag-handle"
+              type="button"
+              :data-layer-key="item.key"
+              title="调整层级"
+              :aria-label="`拖动${layerName(item)}，当前位于第 ${item.displayIndex} 个隐藏层级；按上下方向键移动`"
+              @pointerdown="handlePointerDown($event, item)"
+              @keydown.up.prevent="moveLayerByKeyboard(item, -1)"
+              @keydown.down.prevent="moveLayerByKeyboard(item, 1)"
+            >
+              <GripVertical :size="15" />
+            </button>
+          </template>
+        </PoolingEditor>
+
         <div v-else class="editable-layer">
           <div class="layer-row">
             <span class="layer-index">{{ String(item.displayIndex).padStart(2, '0') }}</span>
@@ -565,7 +672,14 @@ function handlePointerCancel() {
 
       <div class="fixed-layer output-layer">
         <span class="layer-index">{{ String(orderedLayers.length + 1).padStart(2, '0') }}</span>
-        <div><b>输出层</b><small>Softmax</small></div>
+        <div><b>输出层</b><small>{{ outputHead === 'softmax' ? 'Softmax + CE' : 'Sigmoid + BCE' }}</small></div>
+        <SegmentedControl
+          class="output-head-toggle"
+          :model-value="outputHead"
+          :options="outputHeadOptions"
+          label="输出激活与损失"
+          @update:model-value="emit('updateOutputHead', $event as OutputHeadKind)"
+        />
         <strong>10</strong>
       </div>
     </div>
@@ -592,6 +706,10 @@ function handlePointerCancel() {
           <button type="button" role="menuitem" data-testid="add-convolution-layer" @click="addConvolutionLayer">
             <Grid3X3 :size="17" />
             <span><b>二维卷积层</b><small>Conv2D</small></span>
+          </button>
+          <button type="button" role="menuitem" data-testid="add-pooling-layer" @click="addPoolingLayer">
+            <Grid3X3 :size="17" />
+            <span><b>池化层</b><small>Max / Avg / GAP</small></span>
           </button>
         </div>
       </div>

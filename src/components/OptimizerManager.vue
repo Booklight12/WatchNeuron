@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { ArrowLeft, Check, Gauge, Lightbulb, RotateCcw, SlidersHorizontal } from "@lucide/vue";
 import { computed, ref, watch } from "vue";
+import AppSelect, { type AppSelectOption } from "./AppSelect.vue";
+import SegmentedControl, { type SegmentedControlOption } from "./SegmentedControl.vue";
 import type {
   OptimizerConfig,
   OptimizerKind,
@@ -136,6 +138,10 @@ const definitions: Array<{
 ];
 
 type OptimizerRecommendation = (typeof definitions)[number]["recommendation"];
+const optimizerSelectOptions: AppSelectOption[] = definitions.map((definition) => ({
+  value: definition.kind,
+  label: `${definition.label} · ${definition.name}`,
+}));
 
 const fineTuneRecommendations: Record<OptimizerKind, OptimizerRecommendation> = {
   sgd: {
@@ -198,6 +204,10 @@ const fineTuneRecommendations: Record<OptimizerKind, OptimizerRecommendation> = 
 };
 
 const selectedMode = ref<TrainingMode>(props.initialMode);
+const trainingModeOptions: SegmentedControlOption[] = [
+  { value: "scratch", label: "重头训练", testId: "optimizer-profile-scratch" },
+  { value: "finetune", label: "微调训练", testId: "optimizer-profile-finetune" },
+];
 const settings = computed<TrainingSettings>(() => ({
   ...props.profiles[selectedMode.value],
   mathMode: props.profiles.mathMode,
@@ -217,6 +227,7 @@ const recommendationApplied = computed(() => {
   if (settings.value.epochs !== values.epochs || settings.value.learningRate !== values.learningRate) {
     return false;
   }
+  if (settings.value.batchSize !== 16 || settings.value.optimizer.weightDecay !== (selectedMode.value === "scratch" ? 1e-4 : 1e-5)) return false;
   return Object.entries(values.optimizer).every(
     ([key, value]) => settings.value.optimizer[key as keyof OptimizerConfig] === value,
   );
@@ -243,10 +254,12 @@ function applyRecommendation() {
     ...settings.value,
     epochs: values.epochs,
     learningRate: values.learningRate,
+    batchSize: 16,
     optimizer: {
       ...settings.value.optimizer,
       ...values.optimizer,
       kind: selected.value.kind,
+      weightDecay: selectedMode.value === "scratch" ? 1e-4 : 1e-5,
     },
   });
 }
@@ -260,16 +273,19 @@ function applyDefaultProfiles() {
     beta2: 0.999,
     decay: 0.9,
     epsilon: 1e-8,
+    weightDecay: 0.0001,
   };
   emit("update", "scratch", {
     epochs: 10,
     learningRate: 0.018,
+    batchSize: 16,
     mathMode: props.profiles.mathMode,
     optimizer: baseOptimizer,
   });
   emit("update", "finetune", {
     epochs: 5,
     learningRate: 0.0002,
+    batchSize: 16,
     mathMode: props.profiles.mathMode,
     optimizer: { ...baseOptimizer, kind: "adam" },
   });
@@ -292,12 +308,20 @@ function normalizeLearningRate(input: HTMLInputElement) {
   if (!Number.isFinite(value) || value <= 0) input.value = String(settings.value.learningRate);
 }
 
+function setBatchSize(input: HTMLInputElement) {
+  const value = Number(input.value);
+  if (!Number.isFinite(value)) return;
+  updateSettings({ batchSize: Math.max(1, Math.floor(value)) });
+}
+
 function setOptimizerParameter(
-  key: "momentum" | "beta1" | "beta2" | "decay" | "epsilon",
+  key: "momentum" | "beta1" | "beta2" | "decay" | "epsilon" | "weightDecay",
   input: HTMLInputElement,
 ) {
   const value = Number(input.value);
-  const valid = key === "epsilon"
+  const valid = key === "weightDecay"
+    ? Number.isFinite(value) && value >= 0
+    : key === "epsilon"
     ? Number.isFinite(value) && value > 0
     : key === "momentum"
       ? Number.isFinite(value) && value >= 0 && value < 1
@@ -343,32 +367,14 @@ watch(
     </header>
 
     <section class="optimizer-profile-band" aria-label="训练配置档">
-      <div class="optimizer-profile-tabs" role="tablist" aria-label="训练方式">
-        <button
-          type="button"
-          role="tab"
-          :class="{ active: selectedMode === 'scratch' }"
-          :aria-selected="selectedMode === 'scratch'"
-          data-testid="optimizer-profile-scratch"
-          @click="selectMode('scratch')"
-        >
-          <span>重头训练</span>
-          <b>{{ profiles.scratch.epochs }} 轮 · {{ profiles.scratch.learningRate }}</b>
-          <small>{{ profiles.scratch.optimizer.kind.toUpperCase() }}</small>
-        </button>
-        <button
-          type="button"
-          role="tab"
-          :class="{ active: selectedMode === 'finetune' }"
-          :aria-selected="selectedMode === 'finetune'"
-          data-testid="optimizer-profile-finetune"
-          @click="selectMode('finetune')"
-        >
-          <span>微调训练</span>
-          <b>{{ profiles.finetune.epochs }} 轮 · {{ profiles.finetune.learningRate }}</b>
-          <small>{{ profiles.finetune.optimizer.kind.toUpperCase() }}</small>
-        </button>
-      </div>
+      <SegmentedControl
+        class="optimizer-profile-tabs"
+        :model-value="selectedMode"
+        :options="trainingModeOptions"
+        label="训练方式"
+        :disabled="locked"
+        @update:model-value="selectMode($event as TrainingMode)"
+      />
       <button
         class="tool-button optimizer-default-profiles"
         type="button"
@@ -395,6 +401,8 @@ watch(
           <small>{{ parameter.label }}</small>
           <b>{{ parameter.value }}</b>
         </span>
+        <span><small>批大小</small><b>16</b></span>
+        <span><small>Weight Decay</small><b>{{ selectedMode === 'scratch' ? '1e-4' : '1e-5' }}</b></span>
       </div>
       <button
         class="tool-button optimizer-recommendation-apply"
@@ -408,25 +416,30 @@ watch(
     </section>
 
     <section class="optimizer-list" aria-label="可用优化器">
-      <button
-        v-for="definition in definitions"
-        :key="definition.kind"
-        class="optimizer-card"
-        :class="{ active: settings.optimizer.kind === definition.kind }"
-        type="button"
-        :disabled="locked"
-        :data-testid="`optimizer-${definition.kind}`"
-        @click="selectOptimizer(definition.kind)"
+      <label class="optimizer-select-field">
+        <span>选择优化器</span>
+        <AppSelect
+          :model-value="settings.optimizer.kind"
+          :options="optimizerSelectOptions"
+          label="选择优化器"
+          :disabled="locked"
+          mono
+          @update:model-value="selectOptimizer($event as OptimizerKind)"
+        />
+      </label>
+      <article
+        class="optimizer-card optimizer-card-current active"
+        :data-testid="`optimizer-${selected.kind}`"
       >
         <span class="optimizer-card-heading">
-          <i>{{ definition.label }}</i>
-          <Check v-if="settings.optimizer.kind === definition.kind" :size="16" />
+          <i>{{ selected.label }}</i>
+          <Check :size="16" />
         </span>
-        <strong>{{ definition.name }}</strong>
-        <p>{{ definition.summary }}</p>
-        <code>{{ definition.formula }}</code>
-        <small>{{ definition.trait }}</small>
-      </button>
+        <strong>{{ selected.name }}</strong>
+        <p>{{ selected.summary }}</p>
+        <code>{{ selected.formula }}</code>
+        <small>{{ selected.trait }}</small>
+      </article>
     </section>
 
     <section class="optimizer-config-band" aria-labelledby="optimizer-config-heading">
@@ -468,6 +481,38 @@ watch(
               :data-testid="`optimizer-learning-rate-${selectedMode}`"
               @input="setLearningRate($event.target as HTMLInputElement)"
               @blur="normalizeLearningRate($event.target as HTMLInputElement)"
+            />
+          </span>
+        </label>
+
+        <label class="optimizer-field">
+          <span>批大小 <small>NCHW mini-batch，正整数</small></span>
+          <span class="optimizer-input-shell">
+            <input
+              type="number"
+              min="1"
+              step="1"
+              inputmode="numeric"
+              :value="settings.batchSize"
+              :disabled="locked"
+              :data-testid="`optimizer-batch-size-${selectedMode}`"
+              @change="setBatchSize($event.target as HTMLInputElement)"
+            />
+          </span>
+        </label>
+
+        <label class="optimizer-field">
+          <span>Weight Decay <small>大于等于 0，偏置不衰减</small></span>
+          <span class="optimizer-input-shell">
+            <input
+              type="number"
+              min="0"
+              step="any"
+              inputmode="decimal"
+              :value="settings.optimizer.weightDecay"
+              :disabled="locked"
+              data-testid="optimizer-weight-decay"
+              @change="setOptimizerParameter('weightDecay', $event.target as HTMLInputElement)"
             />
           </span>
         </label>

@@ -5,13 +5,16 @@ import type {
   DenseLayerData,
   HiddenLayer,
   NeuralModel,
+  OutputHeadKind,
+  PoolingConfig,
+  PoolingLayerData,
   SerializedModel,
 } from "../types";
 import {
   convolutionOutputShape,
-  convolutionPipeline,
   fitConvolutionsToLayers,
   modelConvolutions,
+  spatialPipeline,
   type FeatureMapShape,
 } from "./convolution";
 
@@ -67,19 +70,24 @@ export function buildModel(
   base: SerializedModel,
   hiddenLayers: HiddenLayer[],
   convolutionConfigs: ConvolutionConfig[] = [],
+  poolingConfigs: PoolingConfig[] = [],
+  outputHead: OutputHeadKind = "softmax",
 ): NeuralModel {
   const layers: DenseLayerData[] = [];
   const defaultHiddenSize = base.architecture[1];
   const normalizedConvolutions = fitConvolutionsToLayers(convolutionConfigs, hiddenLayers);
-  const convolutionEntries = convolutionPipeline(hiddenLayers, normalizedConvolutions);
-  const convolutions = convolutionEntries.map(({ config, input }) =>
-    buildConvolutionLayer(config, input),
-  );
+  const spatialEntries = spatialPipeline(hiddenLayers, normalizedConvolutions, poolingConfigs);
+  const convolutions = spatialEntries
+    .filter((entry) => entry.kind === "conv")
+    .map(({ config, input }) => buildConvolutionLayer(config, input));
+  const poolings = spatialEntries
+    .filter((entry) => entry.kind === "pool")
+    .map(({ config, input, output }) => buildPoolingLayer(config, input, output));
   let previousSize = 784;
 
   for (let index = 0; index < hiddenLayers.length; index++) {
-    for (const convolution of convolutions.filter((item) => item.position === index)) {
-      previousSize = convolution.outputWidth * convolution.outputHeight * convolution.filters;
+    for (const entry of spatialEntries.filter((item) => item.config.position === index)) {
+      previousSize = entry.output.length;
     }
     const current = hiddenLayers[index];
     const weights = makeWeights(
@@ -108,8 +116,8 @@ export function buildModel(
     previousSize = current.units;
   }
 
-  for (const convolution of convolutions.filter((item) => item.position === hiddenLayers.length)) {
-    previousSize = convolution.outputWidth * convolution.outputHeight * convolution.filters;
+  for (const entry of spatialEntries.filter((item) => item.config.position === hiddenLayers.length)) {
+    previousSize = entry.output.length;
   }
   const outputWeights = makeWeights(10, previousSize, 0x7810 + previousSize, "linear");
   copyRows(outputWeights, base.weights[1], 10, previousSize, 10, defaultHiddenSize);
@@ -123,7 +131,9 @@ export function buildModel(
 
   return {
     convolutions,
+    poolings,
     layers,
+    outputHead,
     calibrated:
       convolutions.length === 0 &&
       hiddenLayers.length === 1 &&
@@ -162,7 +172,9 @@ function buildConvolutionLayer(
   }
   return {
     id: config.id,
+    trainable: config.trainable,
     position: config.position,
+    order: config.order,
     inputWidth: input.width,
     inputHeight: input.height,
     inputChannels: input.channels,
@@ -175,6 +187,27 @@ function buildConvolutionLayer(
     activation: config.activation,
     weights,
     biases: new Float32Array(config.filters),
+  };
+}
+
+function buildPoolingLayer(
+  config: PoolingConfig,
+  input: FeatureMapShape,
+  output: FeatureMapShape,
+): PoolingLayerData {
+  return {
+    id: config.id,
+    position: config.position,
+    order: config.order,
+    kind: config.kind,
+    inputWidth: input.width,
+    inputHeight: input.height,
+    inputChannels: input.channels,
+    outputWidth: output.width,
+    outputHeight: output.height,
+    kernelSize: config.kernelSize,
+    stride: config.stride,
+    padding: config.padding,
   };
 }
 

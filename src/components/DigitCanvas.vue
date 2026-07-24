@@ -2,6 +2,7 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { Check, ChevronDown, Database, Eraser, Shuffle, Trash2, Undo2 } from "@lucide/vue";
 import type { DatasetSplit } from "../types";
+import SegmentedControl, { type SegmentedControlOption } from "./SegmentedControl.vue";
 
 const props = withDefaults(
   defineProps<{
@@ -37,6 +38,10 @@ const labelPicker = ref<HTMLElement | null>(null);
 const labelTrigger = ref<HTMLButtonElement | null>(null);
 const labelMenuOpen = ref(false);
 const sampleSplit = ref<DatasetSplit>("training");
+const sampleSplitOptions: SegmentedControlOption[] = [
+  { value: "training", label: "训练" },
+  { value: "test", label: "测试" },
+];
 const captureMessage = ref("");
 let captureMessageTimer: ReturnType<typeof setTimeout> | undefined;
 const history: ImageData[] = [];
@@ -436,26 +441,13 @@ defineExpose({ loadSample, clear });
             </div>
           </Transition>
         </div>
-        <div class="sample-split-toggle" role="group" aria-label="加入的数据集">
-          <button
-            type="button"
-            :class="{ active: sampleSplit === 'training' }"
-            :aria-pressed="sampleSplit === 'training'"
-            :disabled="datasetControlsDisabled"
-            @click="sampleSplit = 'training'"
-          >
-            训练
-          </button>
-          <button
-            type="button"
-            :class="{ active: sampleSplit === 'test' }"
-            :aria-pressed="sampleSplit === 'test'"
-            :disabled="datasetControlsDisabled"
-            @click="sampleSplit = 'test'"
-          >
-            测试
-          </button>
-        </div>
+        <SegmentedControl
+          v-model="sampleSplit"
+          class="sample-split-toggle"
+          :options="sampleSplitOptions"
+          label="加入的数据集"
+          :disabled="datasetControlsDisabled"
+        />
         <button
           class="add-sample-button"
           type="button"

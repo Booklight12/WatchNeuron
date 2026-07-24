@@ -3,6 +3,7 @@ import { computed, ref, watch } from "vue";
 import { ArrowLeft, Database, HardDrive, LockKeyhole, PencilLine, Trash2 } from "@lucide/vue";
 import AppSelect, { type AppSelectOption, type AppSelectValue } from "./AppSelect.vue";
 import SampleThumbnail from "./SampleThumbnail.vue";
+import SegmentedControl, { type SegmentedControlOption } from "./SegmentedControl.vue";
 import type { CustomDatasetSample, DatasetSplit } from "../types";
 
 const props = defineProps<{
@@ -22,6 +23,15 @@ const emit = defineEmits<{
 type SplitFilter = "all" | DatasetSplit;
 
 const splitFilter = ref<SplitFilter>("all");
+const splitFilterOptions: SegmentedControlOption[] = [
+  { value: "all", label: "全部" },
+  { value: "training", label: "训练集" },
+  { value: "test", label: "测试集" },
+];
+const sampleSplitOptions: SegmentedControlOption[] = [
+  { value: "training", label: "训练集" },
+  { value: "test", label: "测试集" },
+];
 const labelFilter = ref<AppSelectValue>("all");
 const selectedIds = ref<Set<string>>(new Set());
 const digitOptions: AppSelectOption[] = Array.from({ length: 10 }, (_, digit) => ({
@@ -180,11 +190,12 @@ watch(
     </section>
 
     <section class="sample-manager-toolbar" aria-label="样本筛选和批量操作">
-      <div class="sample-filter-tabs" role="group" aria-label="数据集筛选">
-        <button type="button" :class="{ active: splitFilter === 'all' }" @click="splitFilter = 'all'">全部</button>
-        <button type="button" :class="{ active: splitFilter === 'training' }" @click="splitFilter = 'training'">训练集</button>
-        <button type="button" :class="{ active: splitFilter === 'test' }" @click="splitFilter = 'test'">测试集</button>
-      </div>
+      <SegmentedControl
+        v-model="splitFilter"
+        class="sample-filter-tabs"
+        :options="splitFilterOptions"
+        label="数据集筛选"
+      />
 
       <label class="sample-label-filter">
         <span>标签</span>
@@ -268,24 +279,14 @@ watch(
             />
           </label>
 
-          <div class="sample-card-split" role="group" aria-label="样本所属数据集">
-            <button
-              type="button"
-              :class="{ active: sample.split === 'training' }"
-              :disabled="locked"
-              @click="emit('update', sample.id, { split: 'training' })"
-            >
-              训练集
-            </button>
-            <button
-              type="button"
-              :class="{ active: sample.split === 'test' }"
-              :disabled="locked"
-              @click="emit('update', sample.id, { split: 'test' })"
-            >
-              测试集
-            </button>
-          </div>
+          <SegmentedControl
+            class="sample-card-split"
+            :model-value="sample.split"
+            :options="sampleSplitOptions"
+            label="样本所属数据集"
+            :disabled="locked"
+            @update:model-value="emit('update', sample.id, { split: $event as DatasetSplit })"
+          />
 
           <dl class="sample-card-metrics">
             <div><dt>有效像素</dt><dd>{{ sample.indices.length }}</dd></div>

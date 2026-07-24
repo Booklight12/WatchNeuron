@@ -2,6 +2,7 @@
 import { ChevronLeft, ChevronRight, Layers3, X } from "@lucide/vue";
 import { computed } from "vue";
 import type { PropagationDirection } from "../types";
+import SegmentedControl, { type SegmentedControlOption } from "./SegmentedControl.vue";
 
 const props = defineProps<{
   training: boolean;
@@ -39,6 +40,10 @@ const rankedValues = computed(() => {
     )
     .slice(0, 10);
 });
+const directionOptions = computed<SegmentedControlOption[]>(() => [
+  { value: "forward", label: "前向传播" },
+  { value: "backward", label: "反向传播", disabled: !props.training },
+]);
 
 function formatNumber(value: number) {
   if (value === 0) return "0.000000";
@@ -71,25 +76,13 @@ function setDirection(direction: PropagationDirection) {
     </header>
 
     <div class="stepper-toolbar">
-      <div class="stepper-direction" role="group" aria-label="传播方向">
-        <button
-          type="button"
-          :class="{ active: direction === 'forward' }"
-          :aria-pressed="direction === 'forward'"
-          @click="setDirection('forward')"
-        >
-          前向传播
-        </button>
-        <button
-          type="button"
-          :class="{ active: direction === 'backward' }"
-          :aria-pressed="direction === 'backward'"
-          :disabled="!training"
-          @click="setDirection('backward')"
-        >
-          反向传播
-        </button>
-      </div>
+      <SegmentedControl
+        class="stepper-direction"
+        :model-value="direction"
+        :options="directionOptions"
+        label="传播方向"
+        @update:model-value="setDirection($event as PropagationDirection)"
+      />
       <div class="stepper-navigation">
         <button type="button" title="上一步" aria-label="上一步" :disabled="!canPrevious" @click="move(-1)">
           <ChevronLeft :size="16" />

@@ -2,8 +2,9 @@
 import { ChevronLeft, ChevronRight, X } from "@lucide/vue";
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { activationLabels } from "../lib/model";
-import { convolutionPipeline, modelConvolutions } from "../lib/convolution";
-import type { ConvolutionConfig, HiddenLayer, NeuralModel, PropagationDirection } from "../types";
+import { convolutionPipeline, modelConvolutions, spatialPipeline } from "../lib/convolution";
+import type { ConvolutionConfig, HiddenLayer, NeuralModel, OutputHeadKind, PoolingConfig, PropagationDirection, TrainingTrace } from "../types";
+import KernelMatrixView from "./KernelMatrixView.vue";
 
 interface VisibleNode {
   layerIndex: number;
@@ -20,12 +21,32 @@ interface InspectedNode {
   y: number;
 }
 
+interface KernelSnapshot {
+  weights: number[];
+  inputChannels: number;
+  kernelSize: number;
+  filter: number;
+  trainable: boolean;
+}
+
+interface NeuronDetail {
+  eyebrow: string;
+  title: string;
+  badge: string;
+  details: Array<{ label: string; value: string }>;
+  note: string;
+  kernel?: KernelSnapshot;
+}
+
 const props = defineProps<{
   layers: HiddenLayer[];
   convolutions: ConvolutionConfig[];
+  poolings: PoolingConfig[];
+  outputHead: OutputHeadKind;
   activations: number[][];
   gradients: number[][];
   model: NeuralModel | null;
+  trace: TrainingTrace | null;
   selectedLayer: number;
   animated: boolean;
   training: boolean;
@@ -39,18 +60,23 @@ const canvas = ref<HTMLCanvasElement | null>(null);
 const popover = ref<HTMLElement | null>(null);
 const nodeTargets = ref<VisibleNode[]>([]);
 const inspectedNode = ref<InspectedNode | null>(null);
-const convolutionEntries = computed(() => convolutionPipeline(props.layers, props.convolutions));
+const convolutionEntries = computed(() => convolutionPipeline(props.layers, props.convolutions, props.poolings));
+const spatialEntries = computed(() => spatialPipeline(props.layers, props.convolutions, props.poolings));
 const visualLayers = computed(() => {
   const result: Array<
     | { kind: "input"; size: number }
     | { kind: "conv"; size: number; convolutionIndex: number }
+    | { kind: "pool"; size: number; spatialIndex: number }
     | { kind: "dense"; size: number; denseIndex: number }
     | { kind: "output"; size: number; denseIndex: number }
   > = [{ kind: "input", size: 784 }];
   for (let position = 0; position <= props.layers.length; position++) {
-    convolutionEntries.value.forEach((entry, convolutionIndex) => {
+    spatialEntries.value.forEach((entry, spatialIndex) => {
       if (entry.config.position === position) {
-        result.push({ kind: "conv", size: entry.output.length, convolutionIndex });
+        if (entry.kind === "conv") {
+          const convolutionIndex = convolutionEntries.value.findIndex(({ config }) => config.id === entry.config.id);
+          result.push({ kind: "conv", size: entry.output.length, convolutionIndex });
+        } else result.push({ kind: "pool", size: entry.output.length, spatialIndex });
       }
     });
     if (position < props.layers.length) {
@@ -94,7 +120,7 @@ function formatNumber(value: number) {
   return value.toExponential(3);
 }
 
-const neuronDetails = computed(() => {
+const neuronDetails = computed<NeuronDetail | null>(() => {
   const selected = inspectedNode.value;
   if (!selected) return null;
   const size = layerSizes.value[selected.layerIndex];
@@ -144,9 +170,19 @@ const neuronDetails = computed(() => {
     const row = Math.floor(position / shape.width);
     const column = position % shape.width;
     const layer = modelConvolutions(props.model)[layerMetadata.convolutionIndex];
+    const weights = props.training
+      ? props.trace?.convolutionWeights[layerMetadata.convolutionIndex] ?? layer?.weights
+      : layer?.weights;
+    const biases = props.training
+      ? props.trace?.convolutionBiases[layerMetadata.convolutionIndex] ?? layer?.biases
+      : layer?.biases;
     const kernelLength = config.kernelSize ** 2;
-    const kernelOffset = filter * (layer?.inputChannels ?? 1) * kernelLength;
-    const kernel = layer?.weights.subarray(kernelOffset, kernelOffset + kernelLength) ?? [];
+    const inputChannels = layer?.inputChannels ?? entry.input.channels;
+    const kernelOffset = filter * inputChannels * kernelLength;
+    const kernel = Array.from(weights ?? []).slice(
+      kernelOffset,
+      kernelOffset + inputChannels * kernelLength,
+    );
     const absoluteMean = kernel.length
       ? Array.from(kernel).reduce((sum, weight) => sum + Math.abs(weight), 0) / kernel.length
       : 0;
@@ -157,16 +193,45 @@ const neuronDetails = computed(() => {
       details: [
         { label: "当前激活", value: formatNumber(value) },
         { label: "特征坐标", value: `行 ${row + 1} · 列 ${column + 1}` },
+        { label: "参数状态", value: config.trainable ? "参与训练" : "已冻结" },
         ...(props.training
           ? [
               { label: "反向梯度", value: formatNumber(gradient) },
               { label: "梯度绝对值", value: formatNumber(Math.abs(gradient)) },
             ]
           : [
-              { label: "卷积偏置", value: formatNumber(layer?.biases[filter] ?? 0) },
+              { label: "卷积偏置", value: formatNumber(biases?.[filter] ?? 0) },
               { label: "核权重绝对均值", value: formatNumber(absoluteMean) },
               { label: "步幅 / 填充", value: `${config.stride} / ${config.padding}` },
             ]),
+      ],
+      kernel: {
+        weights: Array.from(weights ?? []),
+        inputChannels,
+        kernelSize: config.kernelSize,
+        filter,
+        trainable: config.trainable,
+      },
+      note,
+    };
+  }
+
+  if (layerMetadata?.kind === "pool") {
+    const entry = spatialEntries.value[layerMetadata.spatialIndex];
+    if (!entry || entry.kind !== "pool") return null;
+    const mapSize = entry.output.width * entry.output.height;
+    const channel = Math.floor(selected.neuronIndex / mapSize);
+    const position = selected.neuronIndex % mapSize;
+    return {
+      eyebrow: "POOLING SIGNAL",
+      title: `通道 ${channel + 1} · 池化激活 #${position}`,
+      badge: entry.config.kind === "globalAverage" ? "GAP" : entry.config.kind === "max" ? "MaxPool2D" : "AvgPool2D",
+      details: [
+        { label: "当前激活", value: formatNumber(value) },
+        { label: "输出坐标", value: `行 ${Math.floor(position / entry.output.width) + 1} · 列 ${(position % entry.output.width) + 1}` },
+        { label: "输入 / 输出", value: `${entry.input.width}×${entry.input.height} → ${entry.output.width}×${entry.output.height}` },
+        ...(props.training ? [{ label: "反向梯度", value: formatNumber(gradient) }] : []),
+        { label: "可训练参数", value: "无" },
       ],
       note,
     };
@@ -178,7 +243,7 @@ const neuronDetails = computed(() => {
   const denseLayer = props.model?.layers[denseIndex];
   const isOutput = layerMetadata?.kind === "output";
   const activation = isOutput
-    ? "Softmax"
+    ? props.outputHead === "sigmoid" ? "Sigmoid" : "Softmax"
     : activationLabels[props.layers[denseIndex]?.activation ?? "relu"];
   if (props.training) {
     return {
@@ -189,7 +254,7 @@ const neuronDetails = computed(() => {
       badge: `${activation} · 训练快照`,
       details: [
         {
-          label: isOutput ? "当前概率" : "当前激活",
+          label: isOutput ? (props.outputHead === "sigmoid" ? "独立分数" : "当前概率") : "当前激活",
           value: isOutput ? `${(value * 100).toFixed(2)}%` : formatNumber(value),
         },
         { label: "反向梯度", value: formatNumber(gradient) },
@@ -237,7 +302,7 @@ const neuronDetails = computed(() => {
     badge: activation,
     details: [
       {
-        label: isOutput ? "当前概率" : "当前激活",
+        label: isOutput ? (props.outputHead === "sigmoid" ? "独立分数" : "当前概率") : "当前激活",
         value: isOutput ? `${(value * 100).toFixed(2)}%` : formatNumber(value),
       },
       { label: "偏置", value: formatNumber(denseLayer.biases[selected.neuronIndex] ?? 0) },
@@ -257,6 +322,7 @@ function nodeLabel(target: VisibleNode) {
   if (metadata?.kind === "conv") {
     return `卷积激活 ${target.neuronIndex}，点击查看卷积参数`;
   }
+  if (metadata?.kind === "pool") return `池化激活 ${target.neuronIndex}，点击查看状态`;
   if (metadata?.kind === "output") {
     return `数字 ${target.neuronIndex} 输出神经元，点击查看参数`;
   }
@@ -670,6 +736,14 @@ onBeforeUnmount(() => {
           <dd>{{ detail.value }}</dd>
         </div>
       </dl>
+      <KernelMatrixView
+        v-if="neuronDetails.kernel"
+        :weights="neuronDetails.kernel.weights"
+        :input-channels="neuronDetails.kernel.inputChannels"
+        :kernel-size="neuronDetails.kernel.kernelSize"
+        :filter="neuronDetails.kernel.filter"
+        :trainable="neuronDetails.kernel.trainable"
+      />
       <p>{{ neuronDetails.note }}</p>
     </aside>
   </div>

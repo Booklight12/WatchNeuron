@@ -2,13 +2,14 @@
 import { computed } from "vue";
 import { Activity, BadgeCheck, FlaskConical } from "@lucide/vue";
 import { BrainCircuit } from "@lucide/vue";
-import type { ModelStatus } from "../types";
+import type { ModelStatus, OutputHeadKind } from "../types";
 
 const props = defineProps<{
   probabilities: number[];
   status: ModelStatus;
   hasInput: boolean;
   training?: boolean;
+  outputHead: OutputHeadKind;
 }>();
 
 const prediction = computed(() => {
@@ -38,12 +39,12 @@ const confidence = computed(() => Math.max(...props.probabilities) || 0);
     <div class="prediction-readout" aria-live="polite">
       <strong>{{ prediction < 0 ? '—' : prediction }}</strong>
       <div>
-        <span>置信度</span>
+        <span>{{ outputHead === 'sigmoid' ? '最高独立分数' : '置信度' }}</span>
         <b>{{ (confidence * 100).toFixed(1) }}%</b>
       </div>
     </div>
 
-    <div class="probability-list" aria-label="数字概率">
+    <div class="probability-list" :aria-label="outputHead === 'sigmoid' ? '数字独立分数' : '数字概率'">
       <div
         v-for="(probability, digit) in probabilities"
         :key="digit"

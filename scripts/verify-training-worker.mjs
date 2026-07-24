@@ -83,6 +83,7 @@ const noConvolution = {
 const convolutionConfig = {
   id: "conv-primary",
   enabled: true,
+  trainable: true,
   position: 0,
   filters: 2,
   kernelSize: 3,
@@ -115,6 +116,52 @@ const customSamples = [
     values: [0.5, 1, 0.9, 0.8, 0.4],
   },
 ];
+const batchTrainingSamples = [
+  ...customSamples.filter((sample) => sample.split === "training"),
+  {
+    id: "batch-training-probe-1",
+    label: 1,
+    split: "training",
+    indices: [210, 238, 266, 294, 322],
+    values: [0.5, 0.8, 1, 0.8, 0.5],
+  },
+  {
+    id: "batch-training-probe-2",
+    label: 6,
+    split: "training",
+    indices: [320, 321, 349, 377, 405, 406],
+    values: [0.4, 0.9, 1, 1, 0.9, 0.4],
+  },
+  {
+    id: "batch-training-probe-3",
+    label: 8,
+    split: "training",
+    indices: [292, 293, 320, 322, 348, 350, 376, 377],
+    values: [0.6, 0.6, 0.8, 0.8, 1, 1, 0.7, 0.7],
+  },
+];
+const spatialPoolingConfigs = [
+  {
+    id: "pool-max-probe",
+    enabled: true,
+    position: 0,
+    order: 1,
+    kind: "max",
+    kernelSize: 2,
+    stride: 2,
+    padding: 0,
+  },
+  {
+    id: "pool-gap-probe",
+    enabled: true,
+    position: 0,
+    order: 2,
+    kind: "globalAverage",
+    kernelSize: 1,
+    stride: 1,
+    padding: 0,
+  },
+];
 
 let activationIndex = 0;
 let sawValidTrace = false;
@@ -128,6 +175,9 @@ let fineTuneVerified = false;
 let customOnlyVerified = false;
 let convolutionVerified = false;
 let convolutionFineTuneVerified = false;
+let frozenConvolutionVerified = false;
+let frozenConvolutionGradientVerified = false;
+let convolutionParameterTraceVerified = false;
 let middleConvolutionVerified = false;
 let middleConvolutionTraceVerified = false;
 let dropoutVerified = false;
@@ -136,6 +186,10 @@ let multipleConvolutionBaseline = null;
 let multipleConvolutionVerified = false;
 let multipleConvolutionFineTuneVerified = false;
 let multipleConvolutionTraceVerified = false;
+let spatialHeadBaseline = null;
+let spatialHeadTraceVerified = false;
+let spatialHeadVerified = false;
+let spatialHeadFineTuneVerified = false;
 let wasmBackendVerified = false;
 const verifiedOptimizers = new Set();
 const accuracies = [];
@@ -151,6 +205,20 @@ const completed = new Promise((resolvePromise, rejectPromise) => {
     if (verificationStage === "convolution-middle" || verificationStage.startsWith("convolution-multiple")) return "relu";
     if (verificationStage.startsWith("convolution")) return "sigmoid";
     return "relu";
+  }
+
+  function expectedTrainingSamples() {
+    if (verificationStage.startsWith("spatial-head")) return batchTrainingSamples.length;
+    if (verificationStage === "custom-only" || verificationStage.startsWith("convolution")) return 1;
+    return 4001;
+  }
+
+  function expectedTestSamples() {
+    return verificationStage === "custom-only" ||
+      verificationStage.startsWith("convolution") ||
+      verificationStage.startsWith("spatial-head")
+      ? 0
+      : 1001;
   }
 
   function startCurrentActivation() {
@@ -257,6 +325,26 @@ const completed = new Promise((resolvePromise, rejectPromise) => {
     });
   }
 
+  function startFrozenConvolutionTraining(initialModel) {
+    verificationStage = "convolution-frozen";
+    sawValidTrace = false;
+    worker.postMessage({
+      type: "train",
+      datasetUrl: "/mnist-training.bin",
+      mnistEnabled: false,
+      layers: [{ id: "conv-dropout", units: 12, activation: "sigmoid", dropout: 0.5 }],
+      convolutions: [{ ...convolutionConfig, trainable: false }],
+      settings: {
+        epochs: 1,
+        learningRate: 0.003,
+        mathMode: "fast",
+        optimizer: optimizerConfig("adam"),
+      },
+      initialModel,
+      customSamples: customSamples.filter((sample) => sample.split === "training"),
+    });
+  }
+
   function startMultipleConvolutionTraining(initialModel) {
     verificationStage = initialModel ? "convolution-multiple-finetune" : "convolution-multiple";
     sawValidTrace = false;
@@ -274,6 +362,30 @@ const completed = new Promise((resolvePromise, rejectPromise) => {
       },
       initialModel,
       customSamples: customSamples.filter((sample) => sample.split === "training"),
+    });
+  }
+
+  function startSpatialHeadTraining(initialModel) {
+    verificationStage = initialModel ? "spatial-head-finetune" : "spatial-head";
+    sawValidTrace = false;
+    spatialHeadTraceVerified = false;
+    worker.postMessage({
+      type: "train",
+      datasetUrl: "/mnist-training.bin",
+      mnistEnabled: false,
+      layers: [{ id: "spatial-head-dense", units: 12, activation: "relu", dropout: 0 }],
+      convolutions: [{ ...convolutionConfig, id: "conv-pool-probe", order: 0 }],
+      poolings: spatialPoolingConfigs,
+      outputHead: "sigmoid",
+      settings: {
+        epochs: 1,
+        learningRate: 0.003,
+        batchSize: 4,
+        mathMode: "fast",
+        optimizer: { ...optimizerConfig("adam"), weightDecay: 0.02 },
+      },
+      initialModel,
+      customSamples: batchTrainingSamples,
     });
   }
 
@@ -305,11 +417,21 @@ const completed = new Promise((resolvePromise, rejectPromise) => {
       sawValidTrace ||=
         activations.every(Number.isFinite) &&
         softmaxIsNormalized &&
-        message.samples === (verificationStage === "custom-only" || verificationStage.startsWith("convolution") ? 1 : 4001) &&
+        message.samples === expectedTrainingSamples() &&
         gradients.every(Number.isFinite) &&
         gradients.some((value) => Math.abs(value) > 1e-10);
       if (verificationStage.startsWith("convolution")) {
         dropoutVerified ||= activations.some((value) => value === 0) && activations.some((value) => value !== 0);
+        convolutionParameterTraceVerified ||=
+          message.convolutionWeights?.length > 0 &&
+          message.convolutionBiases?.length === message.convolutionWeights.length &&
+          message.convolutionWeights.every((weights) => Array.from(weights).every(Number.isFinite)) &&
+          message.convolutionBiases.every((biases) => Array.from(biases).every(Number.isFinite));
+      }
+      if (verificationStage === "convolution-frozen") {
+        frozenConvolutionGradientVerified ||=
+          Array.from(message.gradients[0]).some((value) => Math.abs(value) > 1e-10) &&
+          Array.from(message.gradients[1]).some((value) => Math.abs(value) > 1e-10);
       }
       if (verificationStage === "convolution-middle") {
         middleConvolutionTraceVerified ||=
@@ -331,6 +453,20 @@ const completed = new Promise((resolvePromise, rejectPromise) => {
             (length, index) => message.activations[index].length === length && message.gradients[index].length === length,
           ) &&
           message.gradients.every((values) => Array.from(values).every(Number.isFinite));
+      }
+      if (verificationStage.startsWith("spatial-head")) {
+        const output = Array.from(message.activations.at(-1));
+        const outputSum = output.reduce((sum, value) => sum + value, 0);
+        spatialHeadTraceVerified ||=
+          message.activations.length === 6 &&
+          message.gradients.length === 6 &&
+          [784, 392, 98, 2, 12, 10].every(
+            (length, index) => message.activations[index].length === length && message.gradients[index].length === length,
+          ) &&
+          message.gradients[2].some((value) => Math.abs(value) > 1e-10) &&
+          message.gradients[3].some((value) => Math.abs(value) > 1e-10) &&
+          output.every((value) => Number.isFinite(value) && value >= 0 && value <= 1) &&
+          Math.abs(outputSum - 1) > 1e-3;
       }
       if (verificationStage === "activations" && activationIndex === 0 && !pauseRequested) {
         pauseRequested = true;
@@ -370,15 +506,15 @@ const completed = new Promise((resolvePromise, rejectPromise) => {
         ...hiddenLayer.biases,
       ].every(Number.isFinite);
       const activation = currentActivation();
-      const expectedTrainingSamples = verificationStage === "custom-only" || verificationStage.startsWith("convolution") ? 1 : 4001;
-      const expectedTestSamples = verificationStage === "custom-only" || verificationStage.startsWith("convolution") ? 0 : 1001;
+      const trainingSampleCount = expectedTrainingSamples();
+      const testSampleCount = expectedTestSamples();
       if (
         !sawValidTrace ||
         hiddenLayer.activation !== activation ||
         !valuesAreFinite ||
         !Number.isFinite(message.accuracy) ||
-        message.trainingSamples !== expectedTrainingSamples ||
-        message.testSamples !== expectedTestSamples ||
+        message.trainingSamples !== trainingSampleCount ||
+        message.testSamples !== testSampleCount ||
         message.backend !== (verificationStage === "convolution-middle"
           ? "Zig/Wasm SIMD · 完整"
           : "Zig/Wasm SIMD · 快速") ||
@@ -424,6 +560,34 @@ const completed = new Promise((resolvePromise, rejectPromise) => {
           return;
         }
         convolutionFineTuneVerified = true;
+        convolutionBaseline = message.model;
+        startFrozenConvolutionTraining(convolutionBaseline);
+        return;
+      }
+
+      if (verificationStage === "convolution-frozen") {
+        const convolution = message.model.convolutions[0];
+        const baseline = convolutionBaseline.convolutions[0];
+        const parametersUnchanged =
+          Array.from(convolution.weights).every((value, index) => value === baseline.weights[index]) &&
+          Array.from(convolution.biases).every((value, index) => value === baseline.biases[index]);
+        const denseChanged = message.model.layers.some((layer, layerIndex) =>
+          Array.from(layer.weights).some(
+            (value, index) => Math.abs(value - convolutionBaseline.layers[layerIndex].weights[index]) > 1e-8,
+          ),
+        );
+        frozenConvolutionVerified = Boolean(
+          convolution &&
+          convolution.trainable === false &&
+          parametersUnchanged &&
+          denseChanged &&
+          frozenConvolutionGradientVerified,
+        );
+        if (!frozenConvolutionVerified) {
+          clearTimeout(timeout);
+          rejectPromise(new Error("Frozen Conv2D changed parameters or stopped gradient propagation"));
+          return;
+        }
         startMiddleConvolutionTraining();
         return;
       }
@@ -485,6 +649,56 @@ const completed = new Promise((resolvePromise, rejectPromise) => {
           rejectPromise(new Error("Loaded multiple-Conv2D model did not continue fine-tuning"));
           return;
         }
+        startSpatialHeadTraining(null);
+        return;
+      }
+
+      if (verificationStage === "spatial-head") {
+        const [maxPool, gap] = message.model.poolings ?? [];
+        spatialHeadVerified = Boolean(
+          spatialHeadTraceVerified &&
+          message.model.outputHead === "sigmoid" &&
+          message.model.poolings?.length === 2 &&
+          maxPool.kind === "max" &&
+          maxPool.outputWidth === 7 &&
+          maxPool.outputHeight === 7 &&
+          gap.kind === "globalAverage" &&
+          gap.outputWidth === 1 &&
+          gap.outputHeight === 1 &&
+          gap.inputChannels === 2 &&
+          hiddenLayer.inputSize === 2,
+        );
+        if (!spatialHeadVerified) {
+          clearTimeout(timeout);
+          rejectPromise(new Error("Conv2D/MaxPool2D/GAP mini-batch Sigmoid training produced an invalid model"));
+          return;
+        }
+        spatialHeadBaseline = message.model;
+        startSpatialHeadTraining(spatialHeadBaseline);
+        return;
+      }
+
+      if (verificationStage === "spatial-head-finetune") {
+        const denseChanged = message.model.layers.some((layer, layerIndex) =>
+          Array.from(layer.weights).some(
+            (value, index) => Math.abs(value - spatialHeadBaseline.layers[layerIndex].weights[index]) > 1e-8,
+          ),
+        );
+        const convolutionChanged = Array.from(message.model.convolutions[0].weights).some(
+          (value, index) => Math.abs(value - spatialHeadBaseline.convolutions[0].weights[index]) > 1e-8,
+        );
+        spatialHeadFineTuneVerified = Boolean(
+          spatialHeadTraceVerified &&
+          denseChanged &&
+          convolutionChanged &&
+          message.model.outputHead === "sigmoid" &&
+          message.model.poolings?.length === 2,
+        );
+        if (!spatialHeadFineTuneVerified) {
+          clearTimeout(timeout);
+          rejectPromise(new Error("Loaded pooled Sigmoid model did not continue fine-tuning"));
+          return;
+        }
         clearTimeout(timeout);
         resolvePromise();
         return;
@@ -533,9 +747,10 @@ try {
     throw new Error("Not all optimizer implementations completed a training run");
   }
   if (!wasmBackendVerified) throw new Error("Training traces did not report the Zig/Wasm SIMD backend");
+  if (!convolutionParameterTraceVerified) throw new Error("Training traces did not include finite Conv2D parameter snapshots");
   const meanDuration = trainingDurations.reduce((sum, value) => sum + value, 0) / trainingDurations.length;
   console.log(
-    `Zig/Wasm SIMD training: fast/full math modes, ${activationKinds.length}/16 activations and ${verifiedOptimizers.size}/5 optimizers passed with pause/save/resume, ${fineTuneVerified ? "dense fine-tune" : "dense fine-tune failure"}, ${customOnlyVerified ? "custom-only dataset" : "custom-only failure"}, ${convolutionVerified ? "trainable Conv2D" : "Conv2D failure"}, ${dropoutVerified ? "Dropout" : "Dropout failure"}, ${convolutionFineTuneVerified ? "Conv2D fine-tune" : "Conv2D fine-tune failure"}, ${middleConvolutionVerified ? "middle-position Conv2D" : "middle-position Conv2D failure"}, ${multipleConvolutionVerified ? "multiple Conv2D" : "multiple Conv2D failure"}, and ${multipleConvolutionFineTuneVerified ? "multiple-Conv2D fine-tune" : "multiple-Conv2D fine-tune failure"}; mean validation ${(meanAccuracy * 100).toFixed(1)}%; mean epoch ${meanDuration.toFixed(1)} ms`,
+    `Zig/Wasm SIMD training: fast/full math modes, ${activationKinds.length}/16 activations and ${verifiedOptimizers.size}/5 optimizers passed with pause/save/resume, ${fineTuneVerified ? "dense fine-tune" : "dense fine-tune failure"}, ${customOnlyVerified ? "custom-only dataset" : "custom-only failure"}, ${convolutionVerified ? "trainable Conv2D" : "Conv2D failure"}, ${frozenConvolutionVerified ? "frozen Conv2D with gradient passthrough" : "frozen Conv2D failure"}, ${dropoutVerified ? "Dropout" : "Dropout failure"}, ${convolutionFineTuneVerified ? "Conv2D fine-tune" : "Conv2D fine-tune failure"}, ${middleConvolutionVerified ? "middle-position Conv2D" : "middle-position Conv2D failure"}, ${multipleConvolutionVerified ? "multiple Conv2D" : "multiple Conv2D failure"}, ${multipleConvolutionFineTuneVerified ? "multiple-Conv2D fine-tune" : "multiple-Conv2D fine-tune failure"}, ${spatialHeadVerified ? "NCHW mini-batch Conv2D/MaxPool2D/GAP + Sigmoid/BCE + Weight Decay" : "spatial/output-head failure"}, and ${spatialHeadFineTuneVerified ? "pooled Sigmoid fine-tune" : "pooled Sigmoid fine-tune failure"}; mean validation ${(meanAccuracy * 100).toFixed(1)}%; mean epoch ${meanDuration.toFixed(1)} ms`,
   );
 } finally {
   await worker.terminate();

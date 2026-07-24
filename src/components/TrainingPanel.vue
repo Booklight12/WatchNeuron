@@ -2,9 +2,11 @@
 import { BrainCircuit, Pause, Play, RefreshCcw, Save, SlidersHorizontal, Square, TrendingUp } from "@lucide/vue";
 import { computed, ref, watch } from "vue";
 import { architectureLayerSizes } from "../lib/convolution";
+import SegmentedControl, { type SegmentedControlOption } from "./SegmentedControl.vue";
 import type {
   ConvolutionConfig,
   HiddenLayer,
+  PoolingConfig,
   TrainingMode,
   TrainingProfiles,
   TrainingProgress,
@@ -14,6 +16,7 @@ import type {
 const props = defineProps<{
   layers: HiddenLayer[];
   convolutions: ConvolutionConfig[];
+  poolings: PoolingConfig[];
   backend: "Wasm SIMD" | "Wasm" | "JavaScript";
   profiles: TrainingProfiles;
   progress: TrainingProgress;
@@ -38,6 +41,14 @@ const emit = defineEmits<{
 }>();
 
 const editingMode = ref<TrainingMode>("scratch");
+const trainingProfileOptions: SegmentedControlOption[] = [
+  { value: "scratch", label: "重头训练", testId: "training-profile-scratch" },
+  { value: "finetune", label: "微调训练", testId: "training-profile-finetune" },
+];
+const mathModeOptions: SegmentedControlOption[] = [
+  { value: "fast", label: "快速", title: "使用近似数学函数以提高速度" },
+  { value: "full", label: "完整", title: "使用标准精度数学函数" },
+];
 const settings = computed<TrainingSettings>(() => ({
   ...props.profiles[editingMode.value],
   mathMode: props.profiles.mathMode,
@@ -83,7 +94,12 @@ const optimizerLabels = {
   adagrad: "AdaGrad",
 };
 
-const trainingLayerSizes = computed(() => architectureLayerSizes(props.layers, props.convolutions));
+const trainingLayerSizes = computed(() => architectureLayerSizes(props.layers, props.convolutions, props.poolings));
+const controlsLocked = computed(
+  () => props.progress.phase === "loading" ||
+    props.progress.phase === "training" ||
+    props.progress.phase === "paused",
+);
 
 watch(
   () => props.canFineTune,
@@ -131,55 +147,25 @@ function progressLabel() {
       </span>
     </div>
 
-    <div v-if="canFineTune" class="training-profile-toggle" role="group" aria-label="训练配置">
-      <button
-        type="button"
-        :class="{ active: editingMode === 'scratch' }"
-        :aria-pressed="editingMode === 'scratch'"
-        :disabled="progress.phase === 'loading' || progress.phase === 'training' || progress.phase === 'paused'"
-        data-testid="training-profile-scratch"
-        @click="editingMode = 'scratch'"
-      >
-        <span>重头训练</span>
-        <b>{{ profiles.scratch.epochs }} 轮 · {{ profiles.scratch.optimizer.kind.toUpperCase() }}</b>
-      </button>
-      <button
-        type="button"
-        :class="{ active: editingMode === 'finetune' }"
-        :aria-pressed="editingMode === 'finetune'"
-        :disabled="progress.phase === 'loading' || progress.phase === 'training' || progress.phase === 'paused'"
-        data-testid="training-profile-finetune"
-        @click="editingMode = 'finetune'"
-      >
-        <span>微调训练</span>
-        <b>{{ profiles.finetune.epochs }} 轮 · {{ profiles.finetune.optimizer.kind.toUpperCase() }}</b>
-      </button>
-    </div>
+    <SegmentedControl
+      v-if="canFineTune"
+      v-model="editingMode"
+      class="training-profile-toggle"
+      :options="trainingProfileOptions"
+      label="训练配置"
+      :disabled="controlsLocked"
+    />
 
     <div class="math-mode-setting">
       <span>数学实现</span>
-      <div class="math-mode-toggle" role="group" aria-label="Zig 数学实现">
-        <button
-          type="button"
-          title="使用近似数学函数以提高速度"
-          :class="{ active: settings.mathMode === 'fast' }"
-          :aria-pressed="settings.mathMode === 'fast'"
-          :disabled="progress.phase === 'loading' || progress.phase === 'training' || progress.phase === 'paused'"
-          @click="setMathMode('fast')"
-        >
-          快速
-        </button>
-        <button
-          type="button"
-          title="使用标准精度数学函数"
-          :class="{ active: settings.mathMode === 'full' }"
-          :aria-pressed="settings.mathMode === 'full'"
-          :disabled="progress.phase === 'loading' || progress.phase === 'training' || progress.phase === 'paused'"
-          @click="setMathMode('full')"
-        >
-          完整
-        </button>
-      </div>
+      <SegmentedControl
+        class="math-mode-toggle"
+        :model-value="settings.mathMode"
+        :options="mathModeOptions"
+        label="Zig 数学实现"
+        :disabled="controlsLocked"
+        @update:model-value="setMathMode($event as 'fast' | 'full')"
+      />
     </div>
 
     <div v-if="canFineTune" class="fine-tune-source">
@@ -223,7 +209,7 @@ function progressLabel() {
         <SlidersHorizontal :size="14" />
         {{ editingMode === 'finetune' ? '微调优化器' : '重训优化器' }}
       </span>
-      <b>{{ optimizerLabels[settings.optimizer.kind] }}</b>
+      <b>{{ optimizerLabels[settings.optimizer.kind] }} · B{{ settings.batchSize }}</b>
     </button>
 
     <div class="dataset-row">

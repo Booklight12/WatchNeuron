@@ -26,13 +26,28 @@ export interface HiddenLayer {
 export interface ConvolutionConfig {
   id: string;
   enabled: boolean;
+  trainable: boolean;
   position: number;
+  order: number;
   filters: number;
   kernelSize: number;
   stride: number;
   padding: number;
   activation: ActivationKind;
   kernels: number[][];
+}
+
+export type PoolingKind = "max" | "average" | "globalAverage";
+
+export interface PoolingConfig {
+  id: string;
+  enabled: boolean;
+  position: number;
+  order: number;
+  kind: PoolingKind;
+  kernelSize: number;
+  stride: number;
+  padding: number;
 }
 
 export type DatasetSplit = "training" | "test";
@@ -55,7 +70,9 @@ export interface DenseLayerData {
 
 export interface ConvolutionLayerData {
   id: string;
+  trainable: boolean;
   position: number;
+  order: number;
   inputWidth: number;
   inputHeight: number;
   inputChannels: number;
@@ -70,11 +87,30 @@ export interface ConvolutionLayerData {
   biases: Float32Array;
 }
 
+export interface PoolingLayerData {
+  id: string;
+  position: number;
+  order: number;
+  kind: PoolingKind;
+  inputWidth: number;
+  inputHeight: number;
+  inputChannels: number;
+  outputWidth: number;
+  outputHeight: number;
+  kernelSize: number;
+  stride: number;
+  padding: number;
+}
+
+export type OutputHeadKind = "softmax" | "sigmoid";
+
 export interface NeuralModel {
   convolutions: ConvolutionLayerData[];
+  poolings: PoolingLayerData[];
   /** Legacy single-layer field kept while IndexedDB records are migrated. */
   convolution?: ConvolutionLayerData | null;
   layers: DenseLayerData[];
+  outputHead: OutputHeadKind;
   calibrated: boolean;
   trained?: boolean;
 }
@@ -97,6 +133,7 @@ export interface SerializedModel {
 export interface TrainingSettings {
   epochs: number;
   learningRate: number;
+  batchSize: number;
   mathMode: MathMode;
   optimizer: OptimizerConfig;
 }
@@ -104,6 +141,7 @@ export interface TrainingSettings {
 export interface TrainingProfileSettings {
   epochs: number;
   learningRate: number;
+  batchSize: number;
   optimizer: OptimizerConfig;
 }
 
@@ -124,6 +162,7 @@ export interface OptimizerConfig {
   beta2: number;
   decay: number;
   epsilon: number;
+  weightDecay: number;
 }
 
 export type PropagationDirection = "forward" | "backward";
@@ -143,6 +182,8 @@ export interface TrainingProgress {
 export interface TrainingTrace {
   activations: number[][];
   gradients: number[][];
+  convolutionWeights: number[][];
+  convolutionBiases: number[][];
   epoch: number;
   sample: number;
   samples: number;
@@ -161,6 +202,8 @@ export interface SavedModel {
   trainingMode?: TrainingMode;
   hiddenLayers: HiddenLayer[];
   convolutionConfigs?: ConvolutionConfig[];
+  poolingConfigs?: PoolingConfig[];
+  outputHead?: OutputHeadKind;
   /** Legacy single-layer field kept while IndexedDB records are migrated. */
   convolutionConfig?: ConvolutionConfig | null;
   model: NeuralModel;

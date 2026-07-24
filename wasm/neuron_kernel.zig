@@ -303,6 +303,13 @@ fn fillZero(values: [*]f32, length: usize) void {
     while (index < length) : (index += 1) values[index] = 0.0;
 }
 
+fn poolingOutputExtent(input_size: usize, kernel_size: usize, stride: usize, padding: isize) usize {
+    const padded_size = @as(isize, @intCast(input_size)) + padding * 2;
+    const signed_kernel = @as(isize, @intCast(kernel_size));
+    if (padded_size < signed_kernel) return 1;
+    return @intCast(@divTrunc(padded_size - signed_kernel, @as(isize, @intCast(stride))) + 1);
+}
+
 fn accumulateScaled(target: [*]f32, source: [*]f32, length: usize, scale: f32) void {
     const scale_lanes: F32x4 = @splat(scale);
     var index: usize = 0;
@@ -390,6 +397,136 @@ pub export fn conv2d_forward(
         }
     }
     activateBuffer(output, output_width * output_height * filters, activation_kind);
+}
+
+pub export fn pool2d_forward(
+    input_ptr: u32,
+    output_ptr: u32,
+    index_ptr: u32,
+    input_width_raw: i32,
+    input_height_raw: i32,
+    channels_raw: i32,
+    kernel_size_raw: i32,
+    stride_raw: i32,
+    padding_raw: i32,
+    pooling_kind: i32,
+) void {
+    const input_width: usize = @intCast(input_width_raw);
+    const input_height: usize = @intCast(input_height_raw);
+    const channels: usize = @intCast(channels_raw);
+    const kernel_size: usize = if (pooling_kind == 2) @max(input_width, input_height) else @intCast(@max(kernel_size_raw, 1));
+    const stride: usize = if (pooling_kind == 2) 1 else @intCast(@max(stride_raw, 1));
+    const padding: isize = if (pooling_kind == 2) 0 else @intCast(@max(padding_raw, 0));
+    const output_width: usize = if (pooling_kind == 2) 1 else poolingOutputExtent(input_width, kernel_size, stride, padding);
+    const output_height: usize = if (pooling_kind == 2) 1 else poolingOutputExtent(input_height, kernel_size, stride, padding);
+    const input = f32Ptr(input_ptr);
+    const output = f32Ptr(output_ptr);
+    const indices = u32Ptr(index_ptr);
+
+    var channel: usize = 0;
+    while (channel < channels) : (channel += 1) {
+        var output_y: usize = 0;
+        while (output_y < output_height) : (output_y += 1) {
+            var output_x: usize = 0;
+            while (output_x < output_width) : (output_x += 1) {
+                var value: f32 = if (pooling_kind == 0) -3.4028235e38 else 0.0;
+                var selected: u32 = 0xffffffff;
+                var count: usize = 0;
+                var kernel_y: usize = 0;
+                while (kernel_y < kernel_size) : (kernel_y += 1) {
+                    const input_y: isize = if (pooling_kind == 2) @intCast(kernel_y) else @as(isize, @intCast(output_y * stride + kernel_y)) - padding;
+                    if (input_y < 0 or input_y >= @as(isize, @intCast(input_height))) continue;
+                    var kernel_x: usize = 0;
+                    while (kernel_x < kernel_size) : (kernel_x += 1) {
+                        const input_x: isize = if (pooling_kind == 2) @intCast(kernel_x) else @as(isize, @intCast(output_x * stride + kernel_x)) - padding;
+                        if (input_x < 0 or input_x >= @as(isize, @intCast(input_width))) continue;
+                        const source_index = channel * input_width * input_height + @as(usize, @intCast(input_y)) * input_width + @as(usize, @intCast(input_x));
+                        if (pooling_kind == 0) {
+                            if (input[source_index] > value) {
+                                value = input[source_index];
+                                selected = @intCast(source_index);
+                            }
+                        } else value += input[source_index];
+                        count += 1;
+                    }
+                }
+                const output_index = channel * output_width * output_height + output_y * output_width + output_x;
+                output[output_index] = if (pooling_kind == 0)
+                    (if (count > 0) value else 0.0)
+                else
+                    value / @as(f32, @floatFromInt(@max(count, 1)));
+                indices[output_index] = selected;
+            }
+        }
+    }
+}
+
+pub export fn pool2d_backward(
+    output_gradient_ptr: u32,
+    input_gradient_ptr: u32,
+    index_ptr: u32,
+    input_width_raw: i32,
+    input_height_raw: i32,
+    channels_raw: i32,
+    kernel_size_raw: i32,
+    stride_raw: i32,
+    padding_raw: i32,
+    pooling_kind: i32,
+) void {
+    const input_width: usize = @intCast(input_width_raw);
+    const input_height: usize = @intCast(input_height_raw);
+    const channels: usize = @intCast(channels_raw);
+    const kernel_size: usize = if (pooling_kind == 2) @max(input_width, input_height) else @intCast(@max(kernel_size_raw, 1));
+    const stride: usize = if (pooling_kind == 2) 1 else @intCast(@max(stride_raw, 1));
+    const padding: isize = if (pooling_kind == 2) 0 else @intCast(@max(padding_raw, 0));
+    const output_width: usize = if (pooling_kind == 2) 1 else poolingOutputExtent(input_width, kernel_size, stride, padding);
+    const output_height: usize = if (pooling_kind == 2) 1 else poolingOutputExtent(input_height, kernel_size, stride, padding);
+    const output_gradient = f32Ptr(output_gradient_ptr);
+    const input_gradient = f32Ptr(input_gradient_ptr);
+    const indices = u32Ptr(index_ptr);
+    fillZero(input_gradient, input_width * input_height * channels);
+
+    var channel: usize = 0;
+    while (channel < channels) : (channel += 1) {
+        var output_y: usize = 0;
+        while (output_y < output_height) : (output_y += 1) {
+            var output_x: usize = 0;
+            while (output_x < output_width) : (output_x += 1) {
+                const output_index = channel * output_width * output_height + output_y * output_width + output_x;
+                const gradient = clampDelta(output_gradient[output_index]);
+                if (pooling_kind == 0) {
+                    if (indices[output_index] != 0xffffffff) {
+                        input_gradient[indices[output_index]] += gradient;
+                    }
+                    continue;
+                }
+                var count: usize = 0;
+                var kernel_y: usize = 0;
+                while (kernel_y < kernel_size) : (kernel_y += 1) {
+                    const input_y: isize = if (pooling_kind == 2) @intCast(kernel_y) else @as(isize, @intCast(output_y * stride + kernel_y)) - padding;
+                    if (input_y < 0 or input_y >= @as(isize, @intCast(input_height))) continue;
+                    var kernel_x: usize = 0;
+                    while (kernel_x < kernel_size) : (kernel_x += 1) {
+                        const input_x: isize = if (pooling_kind == 2) @intCast(kernel_x) else @as(isize, @intCast(output_x * stride + kernel_x)) - padding;
+                        if (input_x >= 0 and input_x < @as(isize, @intCast(input_width))) count += 1;
+                    }
+                }
+                const share = gradient / @as(f32, @floatFromInt(@max(count, 1)));
+                kernel_y = 0;
+                while (kernel_y < kernel_size) : (kernel_y += 1) {
+                    const input_y: isize = if (pooling_kind == 2) @intCast(kernel_y) else @as(isize, @intCast(output_y * stride + kernel_y)) - padding;
+                    if (input_y < 0 or input_y >= @as(isize, @intCast(input_height))) continue;
+                    var kernel_x: usize = 0;
+                    while (kernel_x < kernel_size) : (kernel_x += 1) {
+                        const input_x: isize = if (pooling_kind == 2) @intCast(kernel_x) else @as(isize, @intCast(output_x * stride + kernel_x)) - padding;
+                        if (input_x < 0 or input_x >= @as(isize, @intCast(input_width))) continue;
+                        const source_index = channel * input_width * input_height + @as(usize, @intCast(input_y)) * input_width + @as(usize, @intCast(input_x));
+                        input_gradient[source_index] += share;
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn forwardSparseInternal(
@@ -723,26 +860,12 @@ fn updateParameterF32x4(
     storeF32x4(parameters, index, parameter_lanes - learning_rate_lanes * gradient);
 }
 
-pub export fn conv2d_train(
-    input_ptr: u32,
-    weights_ptr: u32,
-    biases_ptr: u32,
-    preactivation_ptr: u32,
-    output_gradient_ptr: u32,
-    input_gradient_ptr: u32,
-    delta_ptr: u32,
-    weight_first_ptr: u32,
-    bias_first_ptr: u32,
-    weight_second_ptr: u32,
-    bias_second_ptr: u32,
-    input_width_raw: i32,
-    input_height_raw: i32,
-    input_channels_raw: i32,
-    filters_raw: i32,
-    kernel_size_raw: i32,
-    stride_raw: i32,
-    padding_raw: i32,
-    activation_kind: i32,
+pub export fn apply_optimizer(
+    parameters_ptr: u32,
+    gradients_ptr: u32,
+    first_ptr: u32,
+    second_ptr: u32,
+    length_raw: i32,
     optimizer_kind: i32,
     learning_rate: f32,
     momentum: f32,
@@ -752,6 +875,49 @@ pub export fn conv2d_train(
     epsilon: f32,
     beta1_correction: f32,
     beta2_correction: f32,
+    gradient_scale: f32,
+    weight_decay: f32,
+) void {
+    const parameters = f32Ptr(parameters_ptr);
+    const gradients = f32Ptr(gradients_ptr);
+    const first = f32Ptr(first_ptr);
+    const second = f32Ptr(second_ptr);
+    const length: usize = @intCast(length_raw);
+    const shrink = 1.0 - learning_rate * weight_decay;
+    const scale_lanes: F32x4 = @splat(gradient_scale);
+    const shrink_lanes: F32x4 = @splat(shrink);
+    var index: usize = 0;
+    while (index + 4 <= length) : (index += 4) {
+        if (weight_decay > 0.0) storeF32x4(parameters, index, loadF32x4(parameters, index) * shrink_lanes);
+        updateParameterF32x4(parameters, index, loadF32x4(gradients, index) * scale_lanes, learning_rate, optimizer_kind, momentum, decay, beta1, beta2, epsilon, beta1_correction, beta2_correction, first, second);
+        storeF32x4(gradients, index, @splat(0.0));
+    }
+    while (index < length) : (index += 1) {
+        if (weight_decay > 0.0) parameters[index] *= shrink;
+        updateParameter(parameters, index, gradients[index] * gradient_scale, learning_rate, optimizer_kind, momentum, decay, beta1, beta2, epsilon, beta1_correction, beta2_correction, first, second);
+        gradients[index] = 0.0;
+    }
+}
+
+pub export fn conv2d_train(
+    input_ptr: u32,
+    weights_ptr: u32,
+    biases_ptr: u32,
+    preactivation_ptr: u32,
+    output_gradient_ptr: u32,
+    input_gradient_ptr: u32,
+    delta_ptr: u32,
+    weight_gradient_ptr: u32,
+    bias_gradient_ptr: u32,
+    input_width_raw: i32,
+    input_height_raw: i32,
+    input_channels_raw: i32,
+    filters_raw: i32,
+    kernel_size_raw: i32,
+    stride_raw: i32,
+    padding_raw: i32,
+    activation_kind: i32,
+    trainable_raw: i32,
 ) void {
     const input_width: usize = @intCast(input_width_raw);
     const input_height: usize = @intCast(input_height_raw);
@@ -760,19 +926,18 @@ pub export fn conv2d_train(
     const kernel_size: usize = @intCast(kernel_size_raw);
     const stride: usize = @intCast(stride_raw);
     const padding: isize = @intCast(padding_raw);
+    const trainable = trainable_raw != 0;
     const output_width = (input_width + @as(usize, @intCast(padding * 2)) - kernel_size) / stride + 1;
     const output_height = (input_height + @as(usize, @intCast(padding * 2)) - kernel_size) / stride + 1;
     const input = f32Ptr(input_ptr);
     const weights = f32Ptr(weights_ptr);
-    const biases = f32Ptr(biases_ptr);
+    _ = biases_ptr;
     const preactivation = f32Ptr(preactivation_ptr);
     const output_gradient = f32Ptr(output_gradient_ptr);
     const input_gradient = f32Ptr(input_gradient_ptr);
     const delta = f32Ptr(delta_ptr);
-    const weight_first = f32Ptr(weight_first_ptr);
-    const bias_first = f32Ptr(bias_first_ptr);
-    const weight_second = f32Ptr(weight_second_ptr);
-    const bias_second = f32Ptr(bias_second_ptr);
+    const weight_gradients = f32Ptr(weight_gradient_ptr);
+    const bias_gradients = f32Ptr(bias_gradient_ptr);
 
     var input_index: usize = 0;
     while (input_index < input_width * input_height * input_channels) : (input_index += 1) input_gradient[input_index] = 0.0;
@@ -814,7 +979,7 @@ pub export fn conv2d_train(
                 else
                     clampDelta(output_gradient[output_index]) * activationDerivative(preactivation[output_index], activated, activation_kind);
                 if (activation_kind != 5) delta[output_index] = gradient;
-                bias_gradient += gradient;
+                if (trainable) bias_gradient += gradient;
                 var channel: usize = 0;
                 while (channel < input_channels) : (channel += 1) {
                     var kernel_y: usize = 0;
@@ -833,6 +998,8 @@ pub export fn conv2d_train(
                 }
             }
         }
+
+        if (!trainable) continue;
 
         var channel: usize = 0;
         while (channel < input_channels) : (channel += 1) {
@@ -854,11 +1021,11 @@ pub export fn conv2d_train(
                         }
                     }
                     const weight_index = ((filter * input_channels + channel) * kernel_size + kernel_y) * kernel_size + kernel_x;
-                    updateParameter(weights, weight_index, kernel_gradient, learning_rate, optimizer_kind, momentum, decay, beta1, beta2, epsilon, beta1_correction, beta2_correction, weight_first, weight_second);
+                    weight_gradients[weight_index] += kernel_gradient;
                 }
             }
         }
-        updateParameter(biases, filter, bias_gradient, learning_rate, optimizer_kind, momentum, decay, beta1, beta2, epsilon, beta1_correction, beta2_correction, bias_first, bias_second);
+        bias_gradients[filter] += bias_gradient;
     }
 }
 
@@ -875,20 +1042,9 @@ fn updateDenseChain(
     activation_pointers: [*]u32,
     preactivation_pointers: [*]u32,
     delta_pointers: [*]u32,
-    weight_first_pointers: [*]u32,
-    bias_first_pointers: [*]u32,
-    weight_second_pointers: [*]u32,
-    bias_second_pointers: [*]u32,
+    weight_gradient_pointers: [*]u32,
+    bias_gradient_pointers: [*]u32,
     dropout_mask_pointers: [*]u32,
-    optimizer_kind: i32,
-    learning_rate: f32,
-    momentum: f32,
-    decay: f32,
-    beta1: f32,
-    beta2: f32,
-    epsilon: f32,
-    beta1_correction: f32,
-    beta2_correction: f32,
     capture_input_gradient: i32,
     input_gradient_ptr: u32,
     first_input_dense: i32,
@@ -899,12 +1055,10 @@ fn updateDenseChain(
         const input_size: usize = @intCast(input_sizes[layer_cursor]);
         const output_size: usize = @intCast(output_sizes[layer_cursor]);
         const weights = f32Ptr(weight_pointers[layer_cursor]);
-        const biases = f32Ptr(bias_pointers[layer_cursor]);
+        _ = bias_pointers;
         const delta = f32Ptr(delta_pointers[layer_cursor]);
-        const weight_first = f32Ptr(weight_first_pointers[layer_cursor]);
-        const bias_first = f32Ptr(bias_first_pointers[layer_cursor]);
-        const weight_second = f32Ptr(weight_second_pointers[layer_cursor]);
-        const bias_second = f32Ptr(bias_second_pointers[layer_cursor]);
+        const weight_gradients = f32Ptr(weight_gradient_pointers[layer_cursor]);
+        const bias_gradients = f32Ptr(bias_gradient_pointers[layer_cursor]);
 
         if (layer_cursor > 0) {
             const previous_delta = f32Ptr(delta_pointers[layer_cursor - 1]);
@@ -938,17 +1092,17 @@ fn updateDenseChain(
                     const gradient_scale: F32x4 = @splat(output_gradient);
                     while (input + 4 <= input_size) : (input += 4) {
                         const weight_index = offset + input;
-                        updateParameterF32x4(weights, weight_index, loadF32x4(sample_values, input) * gradient_scale, learning_rate, optimizer_kind, momentum, decay, beta1, beta2, epsilon, beta1_correction, beta2_correction, weight_first, weight_second);
+                        storeF32x4(weight_gradients, weight_index, loadF32x4(weight_gradients, weight_index) + loadF32x4(sample_values, input) * gradient_scale);
                     }
                     while (input < input_size) : (input += 1) {
                         const weight_index = offset + input;
-                        updateParameter(weights, weight_index, output_gradient * sample_values[input], learning_rate, optimizer_kind, momentum, decay, beta1, beta2, epsilon, beta1_correction, beta2_correction, weight_first, weight_second);
+                        weight_gradients[weight_index] += output_gradient * sample_values[input];
                     }
                 } else {
                     var pixel: usize = 0;
                     while (pixel < active_count) : (pixel += 1) {
                         const weight_index = offset + sample_indices[pixel];
-                        updateParameter(weights, weight_index, output_gradient * sample_values[pixel], learning_rate, optimizer_kind, momentum, decay, beta1, beta2, epsilon, beta1_correction, beta2_correction, weight_first, weight_second);
+                        weight_gradients[weight_index] += output_gradient * sample_values[pixel];
                     }
                 }
             } else {
@@ -956,14 +1110,14 @@ fn updateDenseChain(
                 const gradient_scale: F32x4 = @splat(output_gradient);
                 while (input + 4 <= input_size) : (input += 4) {
                     const weight_index = offset + input;
-                    updateParameterF32x4(weights, weight_index, loadF32x4(previous, input) * gradient_scale, learning_rate, optimizer_kind, momentum, decay, beta1, beta2, epsilon, beta1_correction, beta2_correction, weight_first, weight_second);
+                    storeF32x4(weight_gradients, weight_index, loadF32x4(weight_gradients, weight_index) + loadF32x4(previous, input) * gradient_scale);
                 }
                 while (input < input_size) : (input += 1) {
                     const weight_index = offset + input;
-                    updateParameter(weights, weight_index, output_gradient * previous[input], learning_rate, optimizer_kind, momentum, decay, beta1, beta2, epsilon, beta1_correction, beta2_correction, weight_first, weight_second);
+                    weight_gradients[weight_index] += output_gradient * previous[input];
                 }
             }
-            updateParameter(biases, output, output_gradient, learning_rate, optimizer_kind, momentum, decay, beta1, beta2, epsilon, beta1_correction, beta2_correction, bias_first, bias_second);
+            bias_gradients[output] += output_gradient;
         }
     }
 }
@@ -982,19 +1136,9 @@ pub export fn train_sample(
     activation_pointers_ptr: u32,
     preactivation_pointers_ptr: u32,
     delta_pointers_ptr: u32,
-    weight_first_pointers_ptr: u32,
-    bias_first_pointers_ptr: u32,
-    weight_second_pointers_ptr: u32,
-    bias_second_pointers_ptr: u32,
-    optimizer_kind: i32,
-    learning_rate: f32,
-    momentum: f32,
-    decay: f32,
-    beta1: f32,
-    beta2: f32,
-    epsilon: f32,
-    beta1_correction: f32,
-    beta2_correction: f32,
+    weight_gradient_pointers_ptr: u32,
+    bias_gradient_pointers_ptr: u32,
+    output_head_kind: i32,
     capture_input_gradient: i32,
     input_gradient_ptr: u32,
     dropout_rates_ptr: u32,
@@ -1015,28 +1159,38 @@ pub export fn train_sample(
     const activation_pointers = u32Ptr(activation_pointers_ptr);
     const preactivation_pointers = u32Ptr(preactivation_pointers_ptr);
     const delta_pointers = u32Ptr(delta_pointers_ptr);
-    const weight_first_pointers = u32Ptr(weight_first_pointers_ptr);
-    const bias_first_pointers = u32Ptr(bias_first_pointers_ptr);
-    const weight_second_pointers = u32Ptr(weight_second_pointers_ptr);
-    const bias_second_pointers = u32Ptr(bias_second_pointers_ptr);
+    const weight_gradient_pointers = u32Ptr(weight_gradient_pointers_ptr);
+    const bias_gradient_pointers = u32Ptr(bias_gradient_pointers_ptr);
     const dropout_rates = f32Ptr(dropout_rates_ptr);
     const dropout_mask_pointers = u32Ptr(dropout_mask_pointers_ptr);
 
-    forwardSparseTrainingInternal(layer_count, sample_indices, sample_values, active_count, input_sizes, output_sizes, activation_kinds, weight_pointers, bias_pointers, activation_pointers, preactivation_pointers, dropout_rates, dropout_mask_pointers, dropout_seed, first_input_dense, true);
+    forwardSparseTrainingInternal(layer_count, sample_indices, sample_values, active_count, input_sizes, output_sizes, activation_kinds, weight_pointers, bias_pointers, activation_pointers, preactivation_pointers, dropout_rates, dropout_mask_pointers, dropout_seed, first_input_dense, false);
 
     const last = layer_count - 1;
     const probabilities = f32Ptr(activation_pointers[last]);
     const output_delta = f32Ptr(delta_pointers[last]);
     const output_count: usize = @intCast(output_sizes[last]);
+    activateBuffer(probabilities, output_count, if (output_head_kind == 1) 3 else 5);
     var index: usize = 0;
+    var loss: f32 = 0.0;
     while (index < output_count) : (index += 1) {
-        output_delta[index] = probabilities[index] - (if (index == label) @as(f32, 1.0) else 0.0);
+        const target: f32 = if (index == label) 1.0 else 0.0;
+        output_delta[index] = probabilities[index] - target;
+        if (output_head_kind == 1) {
+            var probability = probabilities[index];
+            if (probability < 0.00000001) probability = 0.00000001;
+            if (probability > 0.99999999) probability = 0.99999999;
+            loss -= (target * mathLog(probability) + (1.0 - target) * mathLog(1.0 - probability)) / @as(f32, @floatFromInt(output_count));
+            output_delta[index] /= @as(f32, @floatFromInt(output_count));
+        }
     }
-    var label_probability = probabilities[label];
-    if (label_probability < 0.00000001) label_probability = 0.00000001;
-    const loss = -mathLog(label_probability);
+    if (output_head_kind != 1) {
+        var label_probability = probabilities[label];
+        if (label_probability < 0.00000001) label_probability = 0.00000001;
+        loss = -mathLog(label_probability);
+    }
 
-    updateDenseChain(layer_count, sample_indices, sample_values, active_count, input_sizes, output_sizes, activation_kinds, weight_pointers, bias_pointers, activation_pointers, preactivation_pointers, delta_pointers, weight_first_pointers, bias_first_pointers, weight_second_pointers, bias_second_pointers, dropout_mask_pointers, optimizer_kind, learning_rate, momentum, decay, beta1, beta2, epsilon, beta1_correction, beta2_correction, capture_input_gradient, input_gradient_ptr, first_input_dense);
+    updateDenseChain(layer_count, sample_indices, sample_values, active_count, input_sizes, output_sizes, activation_kinds, weight_pointers, bias_pointers, activation_pointers, preactivation_pointers, delta_pointers, weight_gradient_pointers, bias_gradient_pointers, dropout_mask_pointers, capture_input_gradient, input_gradient_ptr, first_input_dense);
     return loss;
 }
 
@@ -1054,19 +1208,8 @@ pub export fn train_dense_from_gradient(
     activation_pointers_ptr: u32,
     preactivation_pointers_ptr: u32,
     delta_pointers_ptr: u32,
-    weight_first_pointers_ptr: u32,
-    bias_first_pointers_ptr: u32,
-    weight_second_pointers_ptr: u32,
-    bias_second_pointers_ptr: u32,
-    optimizer_kind: i32,
-    learning_rate: f32,
-    momentum: f32,
-    decay: f32,
-    beta1: f32,
-    beta2: f32,
-    epsilon: f32,
-    beta1_correction: f32,
-    beta2_correction: f32,
+    weight_gradient_pointers_ptr: u32,
+    bias_gradient_pointers_ptr: u32,
     capture_input_gradient: i32,
     input_gradient_ptr: u32,
     dropout_mask_pointers_ptr: u32,
@@ -1084,10 +1227,8 @@ pub export fn train_dense_from_gradient(
     const activation_pointers = u32Ptr(activation_pointers_ptr);
     const preactivation_pointers = u32Ptr(preactivation_pointers_ptr);
     const delta_pointers = u32Ptr(delta_pointers_ptr);
-    const weight_first_pointers = u32Ptr(weight_first_pointers_ptr);
-    const bias_first_pointers = u32Ptr(bias_first_pointers_ptr);
-    const weight_second_pointers = u32Ptr(weight_second_pointers_ptr);
-    const bias_second_pointers = u32Ptr(bias_second_pointers_ptr);
+    const weight_gradient_pointers = u32Ptr(weight_gradient_pointers_ptr);
+    const bias_gradient_pointers = u32Ptr(bias_gradient_pointers_ptr);
     const dropout_mask_pointers = u32Ptr(dropout_mask_pointers_ptr);
     const last = layer_count - 1;
     const output_count: usize = @intCast(output_sizes[last]);
@@ -1104,5 +1245,5 @@ pub export fn train_dense_from_gradient(
         output_count,
         activation_kinds[last],
     );
-    updateDenseChain(layer_count, sample_indices, sample_values, active_count, input_sizes, output_sizes, activation_kinds, weight_pointers, bias_pointers, activation_pointers, preactivation_pointers, delta_pointers, weight_first_pointers, bias_first_pointers, weight_second_pointers, bias_second_pointers, dropout_mask_pointers, optimizer_kind, learning_rate, momentum, decay, beta1, beta2, epsilon, beta1_correction, beta2_correction, capture_input_gradient, input_gradient_ptr, first_input_dense);
+    updateDenseChain(layer_count, sample_indices, sample_values, active_count, input_sizes, output_sizes, activation_kinds, weight_pointers, bias_pointers, activation_pointers, preactivation_pointers, delta_pointers, weight_gradient_pointers, bias_gradient_pointers, dropout_mask_pointers, capture_input_gradient, input_gradient_ptr, first_input_dense);
 }

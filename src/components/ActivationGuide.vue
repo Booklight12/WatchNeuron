@@ -2,6 +2,7 @@
 import { computed } from "vue";
 import type { ActivationKind } from "../types";
 import { activateScalar } from "../lib/activations";
+import AppSelect, { type AppSelectOption } from "./AppSelect.vue";
 
 export type ActivationGuideKind = ActivationKind;
 
@@ -182,7 +183,11 @@ const guides: Record<ActivationGuideKind, GuideDefinition> = {
   },
 };
 
-const options = Object.entries(guides) as [ActivationGuideKind, GuideDefinition][];
+const guideEntries = Object.entries(guides) as [ActivationGuideKind, GuideDefinition][];
+const activationOptions: AppSelectOption[] = guideEntries.map(([value, guide]) => ({
+  value,
+  label: guide.label,
+}));
 const active = computed(() => guides[props.selected]);
 const plot = { left: 28, right: 250, top: 12, bottom: 108 };
 const xValues = [-4, -2, 0, 2, 4];
@@ -233,19 +238,16 @@ function axisLabel(value: number) {
       <code>{{ active.formula }}</code>
     </header>
 
-    <div class="activation-tabs" role="tablist" aria-label="神经元类型">
-      <button
-        v-for="([kind, guide]) in options"
-        :key="kind"
-        type="button"
-        role="tab"
-        :aria-selected="selected === kind"
-        :class="{ active: selected === kind }"
-        @click="emit('select', kind)"
-      >
-        {{ guide.shortLabel }}
-      </button>
-    </div>
+    <label class="activation-guide-select">
+      <span>激活函数</span>
+      <AppSelect
+        :model-value="selected"
+        :options="activationOptions"
+        label="选择神经元类型"
+        mono
+        @update:model-value="emit('select', $event as ActivationGuideKind)"
+      />
+    </label>
 
     <div class="activation-guide-body">
       <div class="activation-copy">

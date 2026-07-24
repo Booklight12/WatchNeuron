@@ -110,6 +110,24 @@ function clearKernel() {
       </button>
     </div>
 
+    <div class="convolution-training-control">
+      <div>
+        <span>参与训练</span>
+        <small>{{ config.trainable ? "反向传播会修正卷积核与偏置" : "参数已冻结，梯度仍会继续向前传播" }}</small>
+      </div>
+      <label class="switch-control" :title="config.trainable ? '冻结卷积参数' : '启用卷积参数训练'">
+        <input
+          type="checkbox"
+          role="switch"
+          :checked="config.trainable"
+          :aria-label="`卷积层 ${displayIndex} 参与训练`"
+          :data-testid="`convolution-trainable-${config.id}`"
+          @change="updateConfig({ trainable: ($event.target as HTMLInputElement).checked })"
+        />
+        <span aria-hidden="true" />
+      </label>
+    </div>
+
     <div class="convolution-settings">
         <label>
           <span>卷积核</span>

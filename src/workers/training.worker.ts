@@ -11,12 +11,18 @@ import type {
   OptimizerConfig,
   OptimizerKind,
   NeuralModel,
+  OutputHeadKind,
+  PoolingConfig,
+  PoolingLayerData,
   TrainingSettings,
 } from "../types";
 import {
   convolutionOutputShape,
-  convolutionPipeline,
+  modelPoolings,
+  modelSpatialLayers,
+  spatialPipeline,
   fitConvolutionsToLayers,
+  fitPoolingsToLayers,
   modelConvolutions,
 } from "../lib/convolution";
 import {
@@ -38,6 +44,8 @@ interface TrainMessage {
   mnistEnabled?: boolean;
   layers: HiddenLayer[];
   convolutions?: ConvolutionConfig[];
+  poolings?: PoolingConfig[];
+  outputHead?: OutputHeadKind;
   /** Legacy message field accepted by older callers. */
   convolution?: ConvolutionConfig;
   settings: TrainingSettings;
@@ -75,6 +83,8 @@ interface SampleTraceResult {
   loss: number;
   activations: Float32Array[];
   gradients: Float32Array[];
+  convolutionWeights: Float32Array[];
+  convolutionBiases: Float32Array[];
   label: number;
   prediction: number;
 }
@@ -89,6 +99,9 @@ interface TrainingWasmExports extends MathModeWasmExports {
   train_dense_from_gradient: (...args: number[]) => void;
   conv2d_forward: (...args: number[]) => void;
   conv2d_train: (...args: number[]) => void;
+  pool2d_forward: (...args: number[]) => void;
+  pool2d_backward: (...args: number[]) => void;
+  apply_optimizer: (...args: number[]) => void;
   simd_enabled: () => number;
 }
 
@@ -105,6 +118,8 @@ interface WasmPointers {
   biasFirst: number;
   weightSecond: number;
   biasSecond: number;
+  weightGradients: number;
+  biasGradients: number;
   sampleIndices: number;
   sampleValues: number;
   inputGradient: number;
@@ -124,9 +139,30 @@ interface ConvolutionPointers {
   biasFirst: number;
   weightSecond: number;
   biasSecond: number;
+  weightGradient: number;
+  biasGradient: number;
+}
+
+interface PoolingPointers {
+  input: number;
+  output: number;
+  indices: number;
+  inputGradient: number;
+  delta: number;
+}
+
+interface WasmPoolingRuntime {
+  type: "pool";
+  model: PoolingLayerData;
+  pointers: PoolingPointers;
+  input: Float32Array;
+  output: Float32Array;
+  inputGradient: Float32Array;
+  delta: Float32Array;
 }
 
 interface WasmConvolutionRuntime {
+  type: "conv";
   model: ConvolutionLayerData;
   pointers: ConvolutionPointers;
   input: Float32Array;
@@ -135,6 +171,8 @@ interface WasmConvolutionRuntime {
   delta: Float32Array;
   inputGradient: Float32Array;
 }
+
+type WasmSpatialRuntime = WasmConvolutionRuntime | WasmPoolingRuntime;
 
 interface WasmTrainingRuntime {
   wasm: TrainingWasmExports;
@@ -149,9 +187,13 @@ interface WasmTrainingRuntime {
   inputGradient: Float32Array;
   dropoutMasks: Float32Array[];
   convolutions: WasmConvolutionRuntime[];
+  poolings: WasmPoolingRuntime[];
+  spatialLayers: WasmSpatialRuntime[];
+  outputHead: OutputHeadKind;
   backend: "Zig/Wasm SIMD · 快速" | "Zig/Wasm SIMD · 完整" | "Zig/Wasm · 快速" | "Zig/Wasm · 完整";
   mathMode: MathMode;
   step: number;
+  sampleStep: number;
   beta1Power: number;
   beta2Power: number;
 }
@@ -223,7 +265,12 @@ function seededRandom(seed: number) {
   };
 }
 
-function architectureSeed(layers: HiddenLayer[], convolutions: ConvolutionConfig[]) {
+function architectureSeed(
+  layers: HiddenLayer[],
+  convolutions: ConvolutionConfig[],
+  poolings: PoolingConfig[],
+  outputHead: OutputHeadKind,
+) {
   let seed = 0x57a7c11;
   for (const layer of layers) {
     seed = Math.imul(seed ^ layer.units, 16777619);
@@ -239,14 +286,22 @@ function architectureSeed(layers: HiddenLayer[], convolutions: ConvolutionConfig
     seed = Math.imul(seed ^ convolution.stride, 16777619);
     seed = Math.imul(seed ^ convolution.padding, 16777619);
   }
+  for (const pooling of poolings) {
+    seed = Math.imul(seed ^ pooling.position ^ pooling.order, 16777619);
+    seed = Math.imul(seed ^ pooling.kernelSize ^ pooling.stride, 16777619);
+  }
+  seed = Math.imul(seed ^ (outputHead === "sigmoid" ? 0x51 : 0x5f), 16777619);
   return seed >>> 0;
 }
 
 function initializeConvolutions(
   configs: ConvolutionConfig[],
+  poolingConfigs: PoolingConfig[],
   hiddenLayers: HiddenLayer[],
 ): ConvolutionLayerData[] {
-  return convolutionPipeline(hiddenLayers, configs).map(({ config, input, output }) => {
+  return spatialPipeline(hiddenLayers, configs, poolingConfigs)
+    .filter((entry) => entry.kind === "conv")
+    .map(({ config, input, output }) => {
     const kernelLength = config.kernelSize * config.kernelSize;
     const weights = new Float32Array(config.filters * input.channels * kernelLength);
     for (let filter = 0; filter < config.filters; filter++) {
@@ -260,7 +315,9 @@ function initializeConvolutions(
     }
     return {
       id: config.id,
+      trainable: config.trainable,
       position: config.position,
+      order: config.order,
       inputWidth: input.width,
       inputHeight: input.height,
       inputChannels: input.channels,
@@ -273,13 +330,37 @@ function initializeConvolutions(
       activation: config.activation,
       weights,
       biases: new Float32Array(config.filters),
-    };
+    } as ConvolutionLayerData;
   });
+}
+
+function initializePoolings(
+  configs: ConvolutionConfig[],
+  poolingConfigs: PoolingConfig[],
+  hiddenLayers: HiddenLayer[],
+): PoolingLayerData[] {
+  return spatialPipeline(hiddenLayers, configs, poolingConfigs)
+    .filter((entry) => entry.kind === "pool")
+    .map(({ config, input, output }) => ({
+      id: config.id,
+      position: config.position,
+      order: config.order,
+      kind: config.kind,
+      inputWidth: input.width,
+      inputHeight: input.height,
+      inputChannels: input.channels,
+      outputWidth: output.width,
+      outputHeight: output.height,
+      kernelSize: config.kernelSize,
+      stride: config.stride,
+      padding: config.padding,
+    }));
 }
 
 function denseLayerLayout(
   hiddenLayers: HiddenLayer[],
   convolutions: ConvolutionLayerData[],
+  poolings: PoolingLayerData[],
 ) {
   const layout: Array<{
     inputSize: number;
@@ -288,24 +369,30 @@ function denseLayerLayout(
   }> = [];
   let inputSize = 784;
   for (let index = 0; index < hiddenLayers.length; index++) {
-    for (const convolution of convolutions.filter(({ position }) => position === index)) {
-      inputSize = convolution.outputWidth * convolution.outputHeight * convolution.filters;
+    for (const layer of modelSpatialLayers({ convolutions, poolings } as NeuralModel).filter(({ position }) => position === index)) {
+      inputSize = layer.outputWidth * layer.outputHeight * (layer.type === "conv" ? layer.filters : layer.inputChannels);
     }
     const layer = hiddenLayers[index];
     layout.push({ inputSize, outputSize: layer.units, activation: layer.activation });
     inputSize = layer.units;
   }
-  for (const convolution of convolutions.filter(({ position }) => position === hiddenLayers.length)) {
-    inputSize = convolution.outputWidth * convolution.outputHeight * convolution.filters;
+  for (const layer of modelSpatialLayers({ convolutions, poolings } as NeuralModel).filter(({ position }) => position === hiddenLayers.length)) {
+    inputSize = layer.outputWidth * layer.outputHeight * (layer.type === "conv" ? layer.filters : layer.inputChannels);
   }
   layout.push({ inputSize, outputSize: 10, activation: "linear" });
   return layout;
 }
 
-function initializeModel(hiddenLayers: HiddenLayer[], convolutionConfigs: ConvolutionConfig[]): NeuralModel {
-  const random = seededRandom(architectureSeed(hiddenLayers, convolutionConfigs));
-  const convolutions = initializeConvolutions(convolutionConfigs, hiddenLayers);
-  const layers = denseLayerLayout(hiddenLayers, convolutions).map((spec): DenseLayerData => {
+function initializeModel(
+  hiddenLayers: HiddenLayer[],
+  convolutionConfigs: ConvolutionConfig[],
+  poolingConfigs: PoolingConfig[],
+  outputHead: OutputHeadKind,
+): NeuralModel {
+  const random = seededRandom(architectureSeed(hiddenLayers, convolutionConfigs, poolingConfigs, outputHead));
+  const convolutions = initializeConvolutions(convolutionConfigs, poolingConfigs, hiddenLayers);
+  const poolings = initializePoolings(convolutionConfigs, poolingConfigs, hiddenLayers);
+  const layers = denseLayerLayout(hiddenLayers, convolutions, poolings).map((spec): DenseLayerData => {
     const { inputSize, outputSize, activation } = spec;
     const usesHeScale = [
       "relu",
@@ -328,15 +415,18 @@ function initializeModel(hiddenLayers: HiddenLayer[], convolutionConfigs: Convol
       biases: new Float32Array(outputSize),
     };
   });
-  return { convolutions, layers, calibrated: false, trained: false };
+  return { convolutions, poolings, layers, outputHead, calibrated: false, trained: false };
 }
 
 function validateInitialModel(
   hiddenLayers: HiddenLayer[],
   convolutionConfigs: ConvolutionConfig[],
+  poolingConfigs: PoolingConfig[],
+  outputHead: OutputHeadKind,
   initialModel: NeuralModel,
 ) {
-  const expectedConvolutions = initializeConvolutions(convolutionConfigs, hiddenLayers);
+  const expectedConvolutions = initializeConvolutions(convolutionConfigs, poolingConfigs, hiddenLayers);
+  const expectedPoolings = initializePoolings(convolutionConfigs, poolingConfigs, hiddenLayers);
   const convolutions = modelConvolutions(initialModel);
   if (expectedConvolutions.length !== convolutions.length) {
     throw new Error("载入模型的卷积结构与当前架构不匹配");
@@ -370,7 +460,13 @@ function validateInitialModel(
       if (!Number.isFinite(value)) throw new Error("载入模型包含无效卷积偏置");
     }
   }
-  const layout = denseLayerLayout(hiddenLayers, expectedConvolutions);
+  const poolings = modelPoolings(initialModel);
+  if (poolings.length !== expectedPoolings.length || poolings.some((pooling, index) =>
+    JSON.stringify(pooling) !== JSON.stringify(expectedPoolings[index])
+  )) {
+    throw new Error("载入模型的池化结构与当前架构不匹配");
+  }
+  const layout = denseLayerLayout(hiddenLayers, expectedConvolutions, expectedPoolings);
   if (initialModel.layers.length !== layout.length) {
     throw new Error("载入模型的层数与当前架构不匹配");
   }
@@ -396,7 +492,15 @@ function validateInitialModel(
       if (!Number.isFinite(value)) throw new Error("载入模型包含无效偏置");
     }
   }
-  return initialModel;
+  return {
+    ...initialModel,
+    outputHead,
+    poolings: expectedPoolings,
+    convolutions: convolutions.map((convolution, index) => ({
+      ...convolution,
+      trainable: expectedConvolutions[index].trainable,
+    })),
+  };
 }
 
 function normalizeOptimizer(config: OptimizerConfig | undefined): OptimizerConfig {
@@ -418,7 +522,10 @@ function normalizeOptimizer(config: OptimizerConfig | undefined): OptimizerConfi
   const epsilon = Number.isFinite(config?.epsilon) && config!.epsilon > 0
     ? config!.epsilon
     : 1e-8;
-  return { kind, momentum, beta1, beta2, decay, epsilon };
+  const weightDecay = Number.isFinite(config?.weightDecay) && config!.weightDecay >= 0
+    ? config!.weightDecay
+    : 0;
+  return { kind, momentum, beta1, beta2, decay, epsilon, weightDecay };
 }
 
 function align(value: number, alignment = 16) {
@@ -436,6 +543,9 @@ async function loadTrainingWasm() {
       typeof exports.train_dense_from_gradient === "function" &&
       typeof exports.conv2d_forward === "function" &&
       typeof exports.conv2d_train === "function" &&
+      typeof exports.pool2d_forward === "function" &&
+      typeof exports.pool2d_backward === "function" &&
+      typeof exports.apply_optimizer === "function" &&
       typeof exports.set_math_mode === "function" &&
       typeof exports.math_mode === "function" &&
       typeof exports.simd_enabled === "function" &&
@@ -478,6 +588,8 @@ function createWasmTrainingRuntime(
     biasFirst: allocateTable(),
     weightSecond: allocateTable(),
     biasSecond: allocateTable(),
+    weightGradients: allocateTable(),
+    biasGradients: allocateTable(),
     dropoutRates: allocateTable(),
     dropoutMasks: allocateTable(),
     sampleIndices: 0,
@@ -494,6 +606,8 @@ function createWasmTrainingRuntime(
   const biasFirstPointers: number[] = [];
   const weightSecondPointers: number[] = [];
   const biasSecondPointers: number[] = [];
+  const weightGradientPointers: number[] = [];
+  const biasGradientPointers: number[] = [];
   const dropoutMaskPointers: number[] = [];
 
   for (const layer of sourceLayers) {
@@ -506,6 +620,8 @@ function createWasmTrainingRuntime(
     biasFirstPointers.push(allocate(layer.biases.byteLength));
     weightSecondPointers.push(allocate(layer.weights.byteLength));
     biasSecondPointers.push(allocate(layer.biases.byteLength));
+    weightGradientPointers.push(allocate(layer.weights.byteLength));
+    biasGradientPointers.push(allocate(layer.biases.byteLength));
     dropoutMaskPointers.push(allocate(layer.outputSize * 4));
   }
 
@@ -525,6 +641,21 @@ function createWasmTrainingRuntime(
       biasFirst: allocate(sourceConvolution.biases.byteLength),
       weightSecond: allocate(sourceConvolution.weights.byteLength),
       biasSecond: allocate(sourceConvolution.biases.byteLength),
+      weightGradient: allocate(sourceConvolution.weights.byteLength),
+      biasGradient: allocate(sourceConvolution.biases.byteLength),
+    };
+  });
+
+  const sourcePoolings = modelPoolings(sourceModel);
+  const poolingPointers = sourcePoolings.map((pooling): PoolingPointers => {
+    const inputSize = pooling.inputWidth * pooling.inputHeight * pooling.inputChannels;
+    const outputSize = pooling.outputWidth * pooling.outputHeight * pooling.inputChannels;
+    return {
+      input: allocate(inputSize * 4),
+      output: allocate(outputSize * 4),
+      indices: allocate(outputSize * 4),
+      inputGradient: allocate(inputSize * 4),
+      delta: allocate(outputSize * 4),
     };
   });
 
@@ -533,6 +664,10 @@ function createWasmTrainingRuntime(
     ...sourceConvolutions.flatMap((convolution) => [
       convolution.inputWidth * convolution.inputHeight * convolution.inputChannels,
       convolution.outputWidth * convolution.outputHeight * convolution.filters,
+    ]),
+    ...sourcePoolings.flatMap((pooling) => [
+      pooling.inputWidth * pooling.inputHeight * pooling.inputChannels,
+      pooling.outputWidth * pooling.outputHeight * pooling.inputChannels,
     ]),
   );
   pointers.sampleIndices = allocate(sampleCapacity * 2, 2);
@@ -564,6 +699,8 @@ function createWasmTrainingRuntime(
   setPointerTable(pointers.biasFirst, biasFirstPointers);
   setPointerTable(pointers.weightSecond, weightSecondPointers);
   setPointerTable(pointers.biasSecond, biasSecondPointers);
+  setPointerTable(pointers.weightGradients, weightGradientPointers);
+  setPointerTable(pointers.biasGradients, biasGradientPointers);
   setPointerTable(pointers.dropoutMasks, dropoutMaskPointers);
   new Float32Array(buffer, pointers.dropoutRates, layerCount).set(
     sourceLayers.map((_, index) => index < hiddenLayers.length
@@ -580,6 +717,8 @@ function createWasmTrainingRuntime(
     new Float32Array(buffer, biasFirstPointers[index], layer.biases.length).fill(0);
     new Float32Array(buffer, weightSecondPointers[index], layer.weights.length).fill(0);
     new Float32Array(buffer, biasSecondPointers[index], layer.biases.length).fill(0);
+    new Float32Array(buffer, weightGradientPointers[index], layer.weights.length).fill(0);
+    new Float32Array(buffer, biasGradientPointers[index], layer.biases.length).fill(0);
     new Float32Array(buffer, dropoutMaskPointers[index], layer.outputSize).fill(1);
     return { ...layer, weights, biases };
   });
@@ -596,7 +735,10 @@ function createWasmTrainingRuntime(
     new Float32Array(buffer, pointersForConvolution.biasFirst, sourceConvolution.biases.length).fill(0);
     new Float32Array(buffer, pointersForConvolution.weightSecond, sourceConvolution.weights.length).fill(0);
     new Float32Array(buffer, pointersForConvolution.biasSecond, sourceConvolution.biases.length).fill(0);
+    new Float32Array(buffer, pointersForConvolution.weightGradient, sourceConvolution.weights.length).fill(0);
+    new Float32Array(buffer, pointersForConvolution.biasGradient, sourceConvolution.biases.length).fill(0);
     return {
+      type: "conv",
       pointers: pointersForConvolution,
       model: { ...sourceConvolution, weights, biases },
       input: new Float32Array(buffer, pointersForConvolution.input, inputSize),
@@ -606,6 +748,23 @@ function createWasmTrainingRuntime(
       inputGradient: new Float32Array(buffer, pointersForConvolution.inputGradient, inputSize),
     };
   });
+
+  const poolings = sourcePoolings.map((sourcePooling, index): WasmPoolingRuntime => {
+    const pointersForPooling = poolingPointers[index];
+    const inputSize = sourcePooling.inputWidth * sourcePooling.inputHeight * sourcePooling.inputChannels;
+    const outputSize = sourcePooling.outputWidth * sourcePooling.outputHeight * sourcePooling.inputChannels;
+    return {
+      type: "pool",
+      model: { ...sourcePooling },
+      pointers: pointersForPooling,
+      input: new Float32Array(buffer, pointersForPooling.input, inputSize),
+      output: new Float32Array(buffer, pointersForPooling.output, outputSize),
+      inputGradient: new Float32Array(buffer, pointersForPooling.inputGradient, inputSize),
+      delta: new Float32Array(buffer, pointersForPooling.delta, outputSize),
+    };
+  });
+  const spatialLayers: WasmSpatialRuntime[] = [...convolutions, ...poolings]
+    .sort((left, right) => left.model.position - right.model.position || left.model.order - right.model.order);
 
   const sampleIndices = new Uint16Array(buffer, pointers.sampleIndices, sampleCapacity);
 
@@ -630,9 +789,13 @@ function createWasmTrainingRuntime(
     sampleValues: new Float32Array(buffer, pointers.sampleValues, sampleCapacity),
     inputGradient: new Float32Array(buffer, pointers.inputGradient, sampleCapacity),
     convolutions,
+    poolings,
+    spatialLayers,
+    outputHead: sourceModel.outputHead === "sigmoid" ? "sigmoid" : "softmax",
     backend: `${flavor === "simd" ? "Zig/Wasm SIMD" : "Zig/Wasm"} · ${mathMode === "full" ? "完整" : "快速"}`,
     mathMode,
     step: 0,
+    sampleStep: 0,
     beta1Power: 1,
     beta2Power: 1,
   };
@@ -711,23 +874,39 @@ function stageSample(runtime: WasmTrainingRuntime, sample: SparseSample) {
   runtime.sampleValues.set(sample.values);
 }
 
-function stageConvolutionInput(
-  convolution: WasmConvolutionRuntime,
+function stageSpatialInput(
+  layer: WasmSpatialRuntime,
   sample: SparseSample,
   denseInput: Float32Array | null,
 ) {
-  convolution.input.fill(0);
+  layer.input.fill(0);
   if (denseInput) {
-    convolution.input.set(denseInput);
+    layer.input.set(denseInput);
     return;
   }
   for (let index = 0; index < sample.indices.length; index++) {
-    convolution.input[sample.indices[index]] = sample.values[index];
+    layer.input[sample.indices[index]] = sample.values[index];
   }
 }
 
-function forwardConvolution(runtime: WasmTrainingRuntime, convolution: WasmConvolutionRuntime) {
-  const { model, pointers } = convolution;
+function forwardSpatialLayer(runtime: WasmTrainingRuntime, layer: WasmSpatialRuntime) {
+  if (layer.type === "pool") {
+    const { model, pointers } = layer;
+    runtime.wasm.pool2d_forward(
+      pointers.input,
+      pointers.output,
+      pointers.indices,
+      model.inputWidth,
+      model.inputHeight,
+      model.inputChannels,
+      model.kernelSize,
+      model.stride,
+      model.padding,
+      model.kind === "max" ? 0 : model.kind === "average" ? 1 : 2,
+    );
+    return;
+  }
+  const { model, pointers } = layer;
   runtime.wasm.conv2d_forward(
     pointers.input,
     pointers.weights,
@@ -780,7 +959,7 @@ function forwardDenseSegment(
       tableAt(pointers.preactivations, start),
       tableAt(pointers.dropoutRates, start),
       tableAt(pointers.dropoutMasks, start),
-      runtime.step >>> 0,
+      runtime.sampleStep >>> 0,
       inputIsDense ? 1 : 0,
     );
     return;
@@ -801,19 +980,20 @@ function forwardDenseSegment(
   );
 }
 
-function forwardConvolutionPrefix(
+function forwardSpatialPrefix(
   runtime: WasmTrainingRuntime,
   sample: SparseSample,
   training: boolean,
+  nchwInput: Float32Array | null = null,
 ) {
   let denseStart = 0;
   let inputPointer = runtime.pointers.sampleValues;
   let inputCount = sample.indices.length;
   let inputIsDense = false;
-  let inputValues: Float32Array | null = null;
+  let inputValues: Float32Array | null = nchwInput;
 
-  for (const convolution of runtime.convolutions) {
-    const denseCount = convolution.model.position - denseStart;
+  for (const layer of runtime.spatialLayers) {
+    const denseCount = layer.model.position - denseStart;
     if (denseCount > 0) {
       forwardDenseSegment(
         runtime,
@@ -825,19 +1005,19 @@ function forwardConvolutionPrefix(
         inputIsDense,
         training,
       );
-      const finalDenseIndex = convolution.model.position - 1;
+      const finalDenseIndex = layer.model.position - 1;
       inputPointer = pointerAt(runtime, runtime.pointers.activations, finalDenseIndex);
       inputCount = runtime.activations[finalDenseIndex].length;
       inputIsDense = true;
       inputValues = runtime.activations[finalDenseIndex];
     }
-    stageConvolutionInput(convolution, sample, inputValues);
-    forwardConvolution(runtime, convolution);
-    denseStart = convolution.model.position;
-    inputPointer = convolution.pointers.output;
-    inputCount = convolution.output.length;
+    stageSpatialInput(layer, sample, inputValues);
+    forwardSpatialLayer(runtime, layer);
+    denseStart = layer.model.position;
+    inputPointer = layer.pointers.output;
+    inputCount = layer.output.length;
     inputIsDense = true;
-    inputValues = convolution.output;
+    inputValues = layer.output;
   }
 
   return { denseStart, inputPointer, inputCount, inputIsDense };
@@ -845,7 +1025,7 @@ function forwardConvolutionPrefix(
 
 function forwardWithWasm(runtime: WasmTrainingRuntime, sample: SparseSample) {
   stageSample(runtime, sample);
-  const suffix = forwardConvolutionPrefix(runtime, sample, false);
+  const suffix = forwardSpatialPrefix(runtime, sample, false);
   forwardDenseSegment(
     runtime,
     sample,
@@ -866,18 +1046,27 @@ function denseInput(sample: SparseSample) {
   return input;
 }
 
+function packNchwBatch(samples: SparseSample[]) {
+  const tensor = new Float32Array(samples.length * 784);
+  samples.forEach((sample, batchIndex) => {
+    const offset = batchIndex * 784;
+    for (let index = 0; index < sample.indices.length; index++) {
+      tensor[offset + sample.indices[index]] = sample.values[index];
+    }
+  });
+  return tensor;
+}
+
 function trainSampleWithWasm(
   runtime: WasmTrainingRuntime,
   sample: SparseSample,
-  learningRate: number,
   captureTrace = false,
+  nchwInput: Float32Array | null = null,
 ) {
   stageSample(runtime, sample);
-  runtime.step++;
-  runtime.beta1Power *= runtime.config.beta1;
-  runtime.beta2Power *= runtime.config.beta2;
-  const { pointers, config } = runtime;
-  const suffix = forwardConvolutionPrefix(runtime, sample, true);
+  runtime.sampleStep++;
+  const { pointers } = runtime;
+  const suffix = forwardSpatialPrefix(runtime, sample, true, nchwInput);
   const denseStart = suffix.denseStart;
   const denseCount = runtime.model.length - denseStart;
   const loss = runtime.wasm.train_sample(
@@ -894,72 +1083,65 @@ function trainSampleWithWasm(
     tableAt(pointers.activations, denseStart),
     tableAt(pointers.preactivations, denseStart),
     tableAt(pointers.deltas, denseStart),
-    tableAt(pointers.weightFirst, denseStart),
-    tableAt(pointers.biasFirst, denseStart),
-    tableAt(pointers.weightSecond, denseStart),
-    tableAt(pointers.biasSecond, denseStart),
-    optimizerCodes[config.kind],
-    learningRate,
-    config.momentum,
-    config.decay,
-    config.beta1,
-    config.beta2,
-    config.epsilon,
-    1 - runtime.beta1Power,
-    1 - runtime.beta2Power,
-    captureTrace || runtime.convolutions.length > 0 ? 1 : 0,
+    tableAt(pointers.weightGradients, denseStart),
+    tableAt(pointers.biasGradients, denseStart),
+    runtime.outputHead === "sigmoid" ? 1 : 0,
+    captureTrace || runtime.spatialLayers.length > 0 ? 1 : 0,
     pointers.inputGradient,
     tableAt(pointers.dropoutRates, denseStart),
     tableAt(pointers.dropoutMasks, denseStart),
-    runtime.step >>> 0,
+    runtime.sampleStep >>> 0,
     suffix.inputIsDense ? 1 : 0,
   );
   if (!Number.isFinite(loss)) throw new Error("Zig/Wasm 训练产生了无效损失");
   let downstreamGradientPointer = pointers.inputGradient;
-  for (let index = runtime.convolutions.length - 1; index >= 0; index--) {
-    const convolution = runtime.convolutions[index];
-    const model = convolution.model;
-    const convPointers = convolution.pointers;
-    runtime.wasm.conv2d_train(
-      convPointers.input,
-      convPointers.weights,
-      convPointers.biases,
-      convPointers.preactivation,
+  for (let index = runtime.spatialLayers.length - 1; index >= 0; index--) {
+    const layer = runtime.spatialLayers[index];
+    if (layer.type === "pool") {
+      const model = layer.model;
+      layer.delta.set(new Float32Array(runtime.wasm.memory.buffer, downstreamGradientPointer, layer.output.length));
+      runtime.wasm.pool2d_backward(
+        downstreamGradientPointer,
+        layer.pointers.inputGradient,
+        layer.pointers.indices,
+        model.inputWidth,
+        model.inputHeight,
+        model.inputChannels,
+        model.kernelSize,
+        model.stride,
+        model.padding,
+        model.kind === "max" ? 0 : model.kind === "average" ? 1 : 2,
+      );
+    } else runtime.wasm.conv2d_train(
+      layer.pointers.input,
+      layer.pointers.weights,
+      layer.pointers.biases,
+      layer.pointers.preactivation,
       downstreamGradientPointer,
-      convPointers.inputGradient,
-      convPointers.delta,
-      convPointers.weightFirst,
-      convPointers.biasFirst,
-      convPointers.weightSecond,
-      convPointers.biasSecond,
-      model.inputWidth,
-      model.inputHeight,
-      model.inputChannels,
-      model.filters,
-      model.kernelSize,
-      model.stride,
-      model.padding,
-      activationCodes[model.activation],
-      optimizerCodes[config.kind],
-      learningRate,
-      config.momentum,
-      config.decay,
-      config.beta1,
-      config.beta2,
-      config.epsilon,
-      1 - runtime.beta1Power,
-      1 - runtime.beta2Power,
+      layer.pointers.inputGradient,
+      layer.pointers.delta,
+      layer.pointers.weightGradient,
+      layer.pointers.biasGradient,
+      layer.model.inputWidth,
+      layer.model.inputHeight,
+      layer.model.inputChannels,
+      layer.model.filters,
+      layer.model.kernelSize,
+      layer.model.stride,
+      layer.model.padding,
+      activationCodes[layer.model.activation],
+      layer.model.trainable ? 1 : 0,
     );
-    const previousConvolution = runtime.convolutions[index - 1];
-    const segmentStart = previousConvolution?.model.position ?? 0;
-    const segmentCount = model.position - segmentStart;
+    const previousLayer = runtime.spatialLayers[index - 1];
+    const segmentStart = previousLayer?.model.position ?? 0;
+    const segmentCount = layer.model.position - segmentStart;
     if (segmentCount > 0) {
       runtime.wasm.train_dense_from_gradient(
         segmentCount,
         pointers.sampleIndices,
-        previousConvolution?.pointers.output ?? pointers.sampleValues,
-        previousConvolution?.output.length ?? sample.indices.length,
-        convPointers.inputGradient,
+        previousLayer?.pointers.output ?? pointers.sampleValues,
+        previousLayer?.output.length ?? sample.indices.length,
+        layer.pointers.inputGradient,
         tableAt(pointers.inputSizes, segmentStart),
         tableAt(pointers.outputSizes, segmentStart),
         tableAt(pointers.activationKinds, segmentStart),
@@ -968,27 +1150,16 @@ function trainSampleWithWasm(
         tableAt(pointers.activations, segmentStart),
         tableAt(pointers.preactivations, segmentStart),
         tableAt(pointers.deltas, segmentStart),
-        tableAt(pointers.weightFirst, segmentStart),
-        tableAt(pointers.biasFirst, segmentStart),
-        tableAt(pointers.weightSecond, segmentStart),
-        tableAt(pointers.biasSecond, segmentStart),
-        optimizerCodes[config.kind],
-        learningRate,
-        config.momentum,
-        config.decay,
-        config.beta1,
-        config.beta2,
-        config.epsilon,
-        1 - runtime.beta1Power,
-        1 - runtime.beta2Power,
+        tableAt(pointers.weightGradients, segmentStart),
+        tableAt(pointers.biasGradients, segmentStart),
         captureTrace ? 1 : 0,
         pointers.inputGradient,
         tableAt(pointers.dropoutMasks, segmentStart),
-        previousConvolution ? 1 : 0,
+        previousLayer ? 1 : 0,
       );
       downstreamGradientPointer = pointers.inputGradient;
     } else {
-      downstreamGradientPointer = convPointers.inputGradient;
+      downstreamGradientPointer = layer.pointers.inputGradient;
     }
   }
   if (!captureTrace) return loss;
@@ -999,17 +1170,17 @@ function trainSampleWithWasm(
     if (probabilities[index] > probabilities[prediction]) prediction = index;
   }
   const traceActivations: Float32Array[] = [denseInput(sample)];
-  const firstConvolution = runtime.convolutions[0];
-  const inputGradient = firstConvolution
-    ? firstConvolution.model.position > 0
+  const firstSpatialLayer = runtime.spatialLayers[0];
+  const inputGradient = firstSpatialLayer
+    ? firstSpatialLayer.model.position > 0
       ? Float32Array.from(runtime.inputGradient.subarray(0, 784))
-      : Float32Array.from(firstConvolution.inputGradient)
+      : Float32Array.from(firstSpatialLayer.inputGradient)
     : Float32Array.from(runtime.inputGradient.subarray(0, 784));
   const traceGradients: Float32Array[] = [inputGradient];
   for (let layerIndex = 0; layerIndex < runtime.model.length; layerIndex++) {
-    for (const convolution of runtime.convolutions.filter(({ model }) => model.position === layerIndex)) {
-      traceActivations.push(Float32Array.from(convolution.output));
-      traceGradients.push(Float32Array.from(convolution.delta));
+    for (const layer of runtime.spatialLayers.filter(({ model }) => model.position === layerIndex)) {
+      traceActivations.push(Float32Array.from(layer.output));
+      traceGradients.push(Float32Array.from(layer.delta));
     }
     traceActivations.push(Float32Array.from(runtime.activations[layerIndex]));
     traceGradients.push(Float32Array.from(runtime.deltas[layerIndex]));
@@ -1018,9 +1189,57 @@ function trainSampleWithWasm(
     loss,
     activations: traceActivations,
     gradients: traceGradients,
+    convolutionWeights: runtime.convolutions.map((convolution) =>
+      Float32Array.from(convolution.model.weights),
+    ),
+    convolutionBiases: runtime.convolutions.map((convolution) =>
+      Float32Array.from(convolution.model.biases),
+    ),
     label: sample.label,
     prediction,
   } satisfies SampleTraceResult;
+}
+
+function applyBatchUpdates(runtime: WasmTrainingRuntime, learningRate: number, batchCount: number) {
+  runtime.step++;
+  runtime.beta1Power *= runtime.config.beta1;
+  runtime.beta2Power *= runtime.config.beta2;
+  const { config, pointers } = runtime;
+  const apply = (
+    parameters: number,
+    gradients: number,
+    first: number,
+    second: number,
+    length: number,
+    weightDecay: number,
+  ) => runtime.wasm.apply_optimizer(
+    parameters,
+    gradients,
+    first,
+    second,
+    length,
+    optimizerCodes[config.kind],
+    learningRate,
+    config.momentum,
+    config.decay,
+    config.beta1,
+    config.beta2,
+    config.epsilon,
+    1 - runtime.beta1Power,
+    1 - runtime.beta2Power,
+    1 / Math.max(1, batchCount),
+    weightDecay,
+  );
+  runtime.model.forEach((layer, index) => {
+    apply(pointerAt(runtime, pointers.weights, index), pointerAt(runtime, pointers.weightGradients, index), pointerAt(runtime, pointers.weightFirst, index), pointerAt(runtime, pointers.weightSecond, index), layer.weights.length, config.weightDecay);
+    apply(pointerAt(runtime, pointers.biases, index), pointerAt(runtime, pointers.biasGradients, index), pointerAt(runtime, pointers.biasFirst, index), pointerAt(runtime, pointers.biasSecond, index), layer.biases.length, 0);
+  });
+  runtime.convolutions.forEach((convolution) => {
+    if (!convolution.model.trainable) return;
+    const { pointers: convPointers, model } = convolution;
+    apply(convPointers.weights, convPointers.weightGradient, convPointers.weightFirst, convPointers.weightSecond, model.weights.length, config.weightDecay);
+    apply(convPointers.biases, convPointers.biasGradient, convPointers.biasFirst, convPointers.biasSecond, model.biases.length, 0);
+  });
 }
 
 function validateWithWasm(runtime: WasmTrainingRuntime, samples: SparseSample[]) {
@@ -1045,11 +1264,13 @@ function cloneWasmModel(runtime: WasmTrainingRuntime): NeuralModel {
       weights: Float32Array.from(convolution.model.weights),
       biases: Float32Array.from(convolution.model.biases),
     })),
+    poolings: runtime.poolings.map((pooling) => ({ ...pooling.model })),
     layers: runtime.model.map((layer): DenseLayerData => ({
       ...layer,
       weights: Float32Array.from(layer.weights),
       biases: Float32Array.from(layer.biases),
     })),
+    outputHead: runtime.outputHead,
     calibrated: false,
     trained: true,
   };
@@ -1070,6 +1291,8 @@ async function train(message: TrainMessage) {
     message.convolutions ?? legacyConvolutions,
     message.layers,
   );
+  const poolingConfigs = fitPoolingsToLayers(message.poolings ?? [], message.layers);
+  const outputHead: OutputHeadKind = message.outputHead === "sigmoid" ? "sigmoid" : "softmax";
   const epochs = Number.isFinite(message.settings.epochs)
     ? Math.max(1, Math.floor(message.settings.epochs))
     : 1;
@@ -1092,8 +1315,8 @@ async function train(message: TrainMessage) {
     throw new Error("训练集为空，请启用 MNIST 或加入自定义训练样本");
   }
   const sourceModel = message.initialModel
-    ? validateInitialModel(message.layers, convolutionConfigs, message.initialModel)
-    : initializeModel(message.layers, convolutionConfigs);
+    ? validateInitialModel(message.layers, convolutionConfigs, poolingConfigs, outputHead, message.initialModel)
+    : initializeModel(message.layers, convolutionConfigs, poolingConfigs, outputHead);
   const runtime = createWasmTrainingRuntime(
     loadedWasm.exports,
     sourceModel,
@@ -1106,7 +1329,10 @@ async function train(message: TrainMessage) {
   if (!Number.isFinite(message.settings.learningRate) || message.settings.learningRate <= 0) {
     throw new Error("学习率必须是大于 0 的有限数值");
   }
-  const random = seededRandom(architectureSeed(message.layers, convolutionConfigs) ^ 0x9e3779b9);
+  const random = seededRandom(architectureSeed(message.layers, convolutionConfigs, poolingConfigs, outputHead) ^ 0x9e3779b9);
+  const batchSize = Number.isFinite(message.settings.batchSize)
+    ? Math.max(1, Math.floor(message.settings.batchSize))
+    : 16;
   let lastAccuracy = 0;
   activeSnapshotProgress = {
     epoch: 0,
@@ -1129,13 +1355,26 @@ async function train(message: TrainMessage) {
     const learningRate =
       message.settings.learningRate * Math.pow(0.94, epoch);
     let loss = 0;
+    let currentBatchTensor = new Float32Array(0);
     for (let sampleIndex = 0; sampleIndex < training.length; sampleIndex++) {
       const sample = training[sampleIndex];
+      const batchOffset = sampleIndex % batchSize;
+      if (batchOffset === 0) {
+        currentBatchTensor = packNchwBatch(training.slice(sampleIndex, sampleIndex + batchSize));
+      }
       const now = performance.now();
       const captureTrace =
         sampleIndex === 0 ||
         (sampleIndex % traceInterval === 0 && now - lastTraceAt >= 90);
-      const result = trainSampleWithWasm(runtime, sample, learningRate, captureTrace);
+      const result = trainSampleWithWasm(
+        runtime,
+        sample,
+        captureTrace,
+        currentBatchTensor.subarray(batchOffset * 784, (batchOffset + 1) * 784),
+      );
+      const batchCount = (sampleIndex % batchSize) + 1;
+      const batchComplete = batchCount === batchSize || sampleIndex === training.length - 1;
+      if (batchComplete) applyBatchUpdates(runtime, learningRate, batchCount);
       if (typeof result === "number") {
         loss += result;
       } else {
@@ -1148,6 +1387,8 @@ async function train(message: TrainMessage) {
           samples: training.length,
           activations: result.activations,
           gradients: result.gradients,
+          convolutionWeights: result.convolutionWeights,
+          convolutionBiases: result.convolutionBiases,
           label: result.label,
           prediction: result.prediction,
           loss: result.loss,
