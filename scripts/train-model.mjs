@@ -16,14 +16,14 @@ function random() {
   return seed / 4294967296;
 }
 
-function createWeights(length, fanIn) {
-  const scale = Math.sqrt(2 / fanIn);
-  return Float32Array.from({ length }, () => (random() * 2 - 1) * scale);
+function createWeights(length, fanIn, initialization = "he") {
+  const boundary = Math.sqrt((initialization === "he" ? 6 : 3) / fanIn);
+  return Float32Array.from({ length }, () => (random() * 2 - 1) * boundary);
 }
 
 const weights1 = createWeights(INPUTS * HIDDEN, INPUTS);
 const biases1 = new Float32Array(HIDDEN);
-const weights2 = createWeights(HIDDEN * OUTPUTS, HIDDEN);
+const weights2 = createWeights(HIDDEN * OUTPUTS, HIDDEN, "xavier");
 const biases2 = new Float32Array(OUTPUTS);
 
 function sparse(sample) {

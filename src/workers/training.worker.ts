@@ -37,6 +37,14 @@ import {
   type MathModeWasmExports,
   type WasmKernelFlavor,
 } from "../lib/wasm";
+import {
+  createConvolutionWeights,
+  createUniformWeights,
+} from "../lib/initialization";
+import {
+  createTrainingSeed,
+  shuffleForNextEpoch,
+} from "../lib/training-order";
 
 interface SparseSample {
   label: number;
@@ -288,12 +296,14 @@ interface WasmTrainingRuntime {
 
 let cancelled = false;
 let paused = false;
+let pauseAcknowledged = false;
 let pausedAt: number | null = null;
 let pausedDuration = 0;
 let controlWaiters: Array<() => void> = [];
 let activeRuntime: WasmTrainingRuntime | null = null;
 let activeSnapshotProgress: SnapshotProgress | null = null;
 let activeStartedAt: number | null = null;
+let traceSequence = 0;
 let trainingWasmPromise: Promise<{
   exports: TrainingWasmExports;
   flavor: WasmKernelFlavor;
@@ -339,6 +349,10 @@ function activeElapsed(startedAt: number) {
 
 async function waitForControl() {
   await new Promise((resolve) => setTimeout(resolve, 0));
+  if (paused && !cancelled && !pauseAcknowledged) {
+    pauseAcknowledged = true;
+    postMessage({ type: "paused", traceId: traceSequence });
+  }
   while (paused && !cancelled) {
     await new Promise<void>((resolve) => controlWaiters.push(resolve));
   }
@@ -386,21 +400,12 @@ function initializeConvolutions(
   configs: ConvolutionConfig[],
   poolingConfigs: PoolingConfig[],
   hiddenLayers: HiddenLayer[],
+  random: () => number,
 ): ConvolutionLayerData[] {
   return spatialPipeline(hiddenLayers, configs, poolingConfigs)
     .filter((entry) => entry.kind === "conv")
     .map(({ config, input, output }) => {
-    const kernelLength = config.kernelSize * config.kernelSize;
-    const weights = new Float32Array(config.filters * input.channels * kernelLength);
-    for (let filter = 0; filter < config.filters; filter++) {
-      const kernel = config.kernels[filter] ?? [];
-      for (let channel = 0; channel < input.channels; channel++) {
-        for (let index = 0; index < kernelLength; index++) {
-          weights[(filter * input.channels + channel) * kernelLength + index] =
-            Number.isFinite(kernel[index]) ? kernel[index] : 0;
-        }
-      }
-    }
+    const weights = createConvolutionWeights(config, input.channels, random);
     return {
       id: config.id,
       trainable: config.trainable,
@@ -478,27 +483,24 @@ function initializeModel(
   outputHead: OutputHeadKind,
 ): NeuralModel {
   const random = seededRandom(architectureSeed(hiddenLayers, convolutionConfigs, poolingConfigs, outputHead));
-  const convolutions = initializeConvolutions(convolutionConfigs, poolingConfigs, hiddenLayers);
+  const convolutions = initializeConvolutions(
+    convolutionConfigs,
+    poolingConfigs,
+    hiddenLayers,
+    random,
+  );
   const poolings = initializePoolings(convolutionConfigs, poolingConfigs, hiddenLayers);
   const layers = denseLayerLayout(hiddenLayers, convolutions, poolings).map((spec): DenseLayerData => {
     const { inputSize, outputSize, activation } = spec;
-    const usesHeScale = [
-      "relu",
-      "leakyRelu",
-      "elu",
-      "relu6",
-      "gelu",
-      "swish",
-      "mish",
-    ].includes(activation);
-    const scale = Math.sqrt((usesHeScale ? 2 : 1) / inputSize);
     return {
       inputSize,
       outputSize,
       activation,
-      weights: Float32Array.from(
-        { length: inputSize * outputSize },
-        () => (random() * 2 - 1) * scale,
+      weights: createUniformWeights(
+        inputSize * outputSize,
+        inputSize,
+        activation,
+        random,
       ),
       biases: new Float32Array(outputSize),
     };
@@ -513,7 +515,12 @@ function validateInitialModel(
   outputHead: OutputHeadKind,
   initialModel: NeuralModel,
 ) {
-  const expectedConvolutions = initializeConvolutions(convolutionConfigs, poolingConfigs, hiddenLayers);
+  const expectedConvolutions = initializeConvolutions(
+    convolutionConfigs,
+    poolingConfigs,
+    hiddenLayers,
+    seededRandom(0),
+  );
   const expectedPoolings = initializePoolings(convolutionConfigs, poolingConfigs, hiddenLayers);
   const convolutions = modelConvolutions(initialModel);
   if (expectedConvolutions.length !== convolutions.length) {
@@ -1456,15 +1463,14 @@ async function trainWebGpuBatch(
   if (!graph) throw new Error("Zig/WebGPU 计算图尚未初始化");
   const batchSize = samples.length;
   const input = packNchwBatch(samples);
-  runtime.batch.input.set(input, 0);
-  runtime.batch.labels.set(samples.map(({ label }) => label), 0);
+  const labels = Int32Array.from(samples, ({ label }) => label);
   runtime.sampleStep += batchSize;
   runtime.step++;
   runtime.beta1Power *= runtime.config.beta1;
   runtime.beta2Power *= runtime.config.beta2;
   const result = await graph.train(
     input,
-    runtime.batch.labels.subarray(0, batchSize),
+    labels,
     batchSize,
     runtime.sampleStep >>> 0,
     captureTrace,
@@ -1482,8 +1488,6 @@ async function trainWebGpuBatch(
       weightDecay: runtime.config.weightDecay,
     },
   );
-  runtime.batch.losses.set(result.losses);
-
   let totalLoss = 0;
   for (let index = 0; index < batchSize; index++) {
     const value = result.losses[index];
@@ -1505,9 +1509,9 @@ async function trainWebGpuBatch(
   }
   return {
     batchLoss: totalLoss,
-    loss: runtime.batch.losses[0],
+    loss: result.losses[0],
     activations: [
-      Float32Array.from(runtime.batch.input.subarray(0, 784)),
+      Float32Array.from(input.subarray(0, 784)),
       ...result.outputs,
     ],
     gradients: [
@@ -1880,8 +1884,10 @@ function cloneWasmModel(runtime: WasmTrainingRuntime): NeuralModel {
 async function train(message: TrainMessage) {
   cancelled = false;
   paused = false;
+  pauseAcknowledged = false;
   pausedAt = null;
   pausedDuration = 0;
+  traceSequence = 0;
   activeRuntime = null;
   activeSnapshotProgress = null;
   wakeControlWaiters();
@@ -1964,7 +1970,10 @@ async function train(message: TrainMessage) {
   if (!Number.isFinite(message.settings.learningRate) || message.settings.learningRate <= 0) {
     throw new Error("学习率必须是大于 0 的有限数值");
   }
-  const random = seededRandom(architectureSeed(message.layers, convolutionConfigs, poolingConfigs, outputHead) ^ 0x9e3779b9);
+  const random = seededRandom(
+    architectureSeed(message.layers, convolutionConfigs, poolingConfigs, outputHead) ^
+    createTrainingSeed(),
+  );
   let lastAccuracy = 0;
   activeSnapshotProgress = {
     epoch: 0,
@@ -1980,8 +1989,10 @@ async function train(message: TrainMessage) {
   const traceInterval = Math.max(1, Math.floor(training.length / 6));
   const emitTrace = (result: SampleTraceResult, epoch: number, sample: number) => {
     lastTraceAt = performance.now();
+    traceSequence++;
     postMessage({
       type: "trace",
+      id: traceSequence,
       epoch,
       sample,
       samples: training.length,
@@ -1997,10 +2008,7 @@ async function train(message: TrainMessage) {
   };
 
   for (let epoch = 0; epoch < epochs; epoch++) {
-    for (let cursor = training.length - 1; cursor > 0; cursor--) {
-      const swap = Math.floor(random() * (cursor + 1));
-      [training[cursor], training[swap]] = [training[swap], training[cursor]];
-    }
+    shuffleForNextEpoch(training, random);
     const learningRate =
       message.settings.learningRate * Math.pow(0.94, epoch);
     let loss = 0;
@@ -2212,14 +2220,15 @@ self.onmessage = async (event: MessageEvent<TrainMessage | CancelMessage | Pause
   if (event.data.type === "pause") {
     if (!paused && !cancelled) {
       paused = true;
+      pauseAcknowledged = false;
       pausedAt = performance.now();
-      postMessage({ type: "paused" });
     }
     return;
   }
   if (event.data.type === "resume") {
     if (paused && !cancelled) {
       paused = false;
+      pauseAcknowledged = false;
       if (pausedAt !== null) pausedDuration += performance.now() - pausedAt;
       pausedAt = null;
       wakeControlWaiters();

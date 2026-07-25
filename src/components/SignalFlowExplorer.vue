@@ -98,6 +98,7 @@ const frozenActivations = shallowRef<number[][] | null>(null);
 const frozenGradients = shallowRef<number[][] | null>(null);
 const frozenMeta = ref<FrozenMeta | null>(null);
 const pauseRequested = ref(false);
+const frozenByTrainingPause = ref(false);
 const inspector = ref<HTMLElement | null>(null);
 const inspectorOpen = ref(false);
 const inspectorAnchor = ref({ x: 0, y: 0 });
@@ -183,7 +184,13 @@ const displayedActivations = computed(() => frozenActivations.value ?? props.act
 const displayedGradients = computed(() => frozenGradients.value ?? props.gradients);
 const displayingTraining = computed(() => frozenMeta.value?.training ?? props.training);
 const viewerPaused = computed(
-  () => frozenActivations.value !== null || props.progress.phase === "paused",
+  () =>
+    pauseRequested.value ||
+    frozenActivations.value !== null ||
+    props.progress.phase === "paused",
+);
+const pausePending = computed(
+  () => pauseRequested.value && props.progress.phase !== "paused",
 );
 const hasGradients = computed(
   () => displayingTraining.value && displayedGradients.value.some((values) => values?.length > 0),
@@ -254,6 +261,7 @@ function captureSnapshot() {
   frozenGradients.value = displayedGradients.value.map((values) => [...values]);
   const trace = props.trace
     ? {
+        id: props.trace.id,
         epoch: props.trace.epoch,
         sample: props.trace.sample,
         samples: props.trace.samples,
@@ -274,13 +282,15 @@ function togglePause() {
     frozenMeta.value = null;
     if (props.progress.phase === "paused" || pauseRequested.value) emit("resumeTraining");
     pauseRequested.value = false;
+    frozenByTrainingPause.value = false;
     return;
   }
-  captureSnapshot();
   if (props.progress.phase === "training") {
     pauseRequested.value = true;
     emit("pauseTraining");
+    return;
   }
+  captureSnapshot();
 }
 
 function selectNeuron(
@@ -517,8 +527,23 @@ watch(layerDescriptors, (layers) => {
 
 watch(
   () => props.progress.phase,
-  (phase) => {
-    if (phase === "paused") pauseRequested.value = false;
+  (phase, previousPhase) => {
+    if (phase === "paused") {
+      captureSnapshot();
+      frozenByTrainingPause.value = true;
+      pauseRequested.value = false;
+      return;
+    }
+    if (
+      phase === "training" &&
+      previousPhase === "paused" &&
+      frozenByTrainingPause.value
+    ) {
+      frozenActivations.value = null;
+      frozenGradients.value = null;
+      frozenMeta.value = null;
+      frozenByTrainingPause.value = false;
+    }
   },
 );
 
@@ -555,7 +580,7 @@ onBeforeUnmount(() => {
         <span class="signal-capture-state" :class="{ paused: viewerPaused }">
           <Snowflake v-if="viewerPaused" :size="14" />
           <Radio v-else :size="14" />
-          {{ viewerPaused ? "快照已冻结" : "实时采样" }}
+          {{ pausePending ? "正在同步快照" : viewerPaused ? "快照已冻结" : "实时采样" }}
         </span>
         <button
           class="signal-pause-button"
@@ -566,7 +591,7 @@ onBeforeUnmount(() => {
         >
           <Play v-if="viewerPaused" :size="16" />
           <Pause v-else :size="16" />
-          {{ viewerPaused ? (progress.phase === "paused" ? "继续训练" : "继续采样") : "暂停并检查" }}
+          {{ pausePending ? "取消暂停" : viewerPaused ? (progress.phase === "paused" ? "继续训练" : "继续采样") : "暂停并检查" }}
         </button>
       </div>
     </header>

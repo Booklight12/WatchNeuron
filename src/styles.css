@@ -3162,6 +3162,34 @@ button:disabled {
   border-top: 1px solid var(--line);
 }
 
+.convolution-initialization-control {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(190px, 0.72fr);
+  align-items: center;
+  gap: 16px;
+  padding: 12px 14px;
+  border: 1px solid rgba(134, 153, 177, 0.14);
+  border-radius: 10px;
+  background: rgba(10, 18, 29, 0.42);
+}
+
+.convolution-initialization-control > div:first-child {
+  display: grid;
+  gap: 4px;
+}
+
+.convolution-initialization-control span {
+  color: var(--text-strong);
+  font-size: 0.76rem;
+  font-weight: 700;
+}
+
+.convolution-initialization-control small {
+  color: var(--text-muted);
+  font-size: 0.68rem;
+  line-height: 1.45;
+}
+
 .convolution-training-control > div {
   display: grid;
   min-width: 0;
@@ -5132,6 +5160,10 @@ button:disabled {
 
   .convolution-settings {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .convolution-initialization-control {
+    grid-template-columns: 1fr;
   }
 
   .convolution-activation {

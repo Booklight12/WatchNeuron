@@ -32,12 +32,48 @@
         };
         const runTraining = (message, timeoutMs = 120000) => new Promise((resolve, reject) => {
           const worker = new Worker("/src/workers/training.worker.ts", { type: "module" });
+          let lastTraceId = 0;
+          let traceConsistent = true;
+          let pauseRequested = false;
+          let pauseAcknowledged = false;
+          let resumed = false;
           const timeout = setTimeout(() => {
             worker.terminate();
             reject(new Error(`${message.settings.computeBackend} training worker timed out`));
           }, timeoutMs);
           worker.onmessage = (event) => {
-            if (event.data.type === "complete") {
+            if (event.data.type === "trace") {
+              lastTraceId = event.data.id;
+              if (message.verifyTrace) {
+                const sample = message.customSamples.find(
+                  (candidate) =>
+                    candidate.split === "training" &&
+                    candidate.label === event.data.label,
+                );
+                const input = Array.from(event.data.activations[0]);
+                traceConsistent &&= Boolean(
+                  sample &&
+                  input.length === 784 &&
+                  sample.indices.every(
+                    (index, position) =>
+                      Math.abs(input[index] - sample.values[position]) < 1e-6,
+                  ) &&
+                  input.every(
+                    (value, index) =>
+                      sample.indices.includes(index) || Math.abs(value) < 1e-8,
+                  ),
+                );
+              }
+              if (message.pauseOnTrace && !pauseRequested) {
+                pauseRequested = true;
+                worker.postMessage({ type: "pause" });
+              }
+            } else if (event.data.type === "paused") {
+              pauseAcknowledged = event.data.traceId === lastTraceId;
+              worker.postMessage({ type: "resume" });
+            } else if (event.data.type === "resumed") {
+              resumed = true;
+            } else if (event.data.type === "complete") {
               clearTimeout(timeout);
               worker.terminate();
               resolve({
@@ -46,6 +82,9 @@
                 trainingSamples: event.data.trainingSamples,
                 finite: event.data.model.layers.every((layer) =>
                   [...layer.weights, ...layer.biases].every(Number.isFinite)),
+                traceConsistent,
+                pauseSynchronized:
+                  !message.pauseOnTrace || (pauseAcknowledged && resumed),
               });
             } else if (event.data.type === "error") {
               clearTimeout(timeout);
@@ -306,6 +345,8 @@
             { id: "gpu-1", label: 1, split: "training", indices: [2, 3], values: [1, 0.5] },
             { id: "gpu-test", label: 0, split: "test", indices: [0, 1], values: [1, 0.5] },
           ],
+          verifyTrace: true,
+          pauseOnTrace: true,
         });
 
         const benchmarkSamples = Array.from({ length: 264 }, (_, sample) => {
@@ -415,6 +456,9 @@
         };
         if (!workerResult.finite || !webgpuBenchmark.finite || !wasmBenchmark.finite) {
           throw new Error("training produced a non-finite parameter");
+        }
+        if (!workerResult.traceConsistent || !workerResult.pauseSynchronized) {
+          throw new Error("WebGPU trace input/label or pause acknowledgement was not synchronized");
         }
         if (!workerResult.backend.includes("快速")) {
           throw new Error(`WebGPU worker ignored fast math mode: ${workerResult.backend}`);

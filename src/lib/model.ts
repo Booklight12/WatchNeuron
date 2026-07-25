@@ -17,6 +17,10 @@ import {
   spatialPipeline,
   type FeatureMapShape,
 } from "./convolution";
+import {
+  createConvolutionWeights,
+  createUniformWeights,
+} from "./initialization";
 
 function seededRandom(seed: number) {
   let state = seed >>> 0;
@@ -33,19 +37,11 @@ function makeWeights(
   activation: ActivationKind = "relu",
 ) {
   const random = seededRandom(seed);
-  const usesHeScale = [
-    "relu",
-    "leakyRelu",
-    "elu",
-    "relu6",
-    "gelu",
-    "swish",
-    "mish",
-  ].includes(activation);
-  const scale = Math.sqrt((usesHeScale ? 2 : 1) / inputSize);
-  return Float32Array.from(
-    { length: outputSize * inputSize },
-    () => (random() * 2 - 1) * scale,
+  return createUniformWeights(
+    outputSize * inputSize,
+    inputSize,
+    activation,
+    random,
   );
 }
 
@@ -159,17 +155,15 @@ function buildConvolutionLayer(
 ): ConvolutionLayerData {
   const output = convolutionOutputShape(config, input);
   const kernelLength = config.kernelSize * config.kernelSize;
-  const expectedWeights = config.filters * input.channels * kernelLength;
-  const weights = new Float32Array(expectedWeights);
-  for (let filter = 0; filter < config.filters; filter++) {
-    const kernel = config.kernels[filter] ?? [];
-    for (let channel = 0; channel < input.channels; channel++) {
-      for (let index = 0; index < kernelLength; index++) {
-        weights[(filter * input.channels + channel) * kernelLength + index] =
-          Number.isFinite(kernel[index]) ? kernel[index] : 0;
-      }
-    }
-  }
+  const random = seededRandom(
+    0x63f17a2d ^
+    config.position * 0x9e3779b9 ^
+    config.order * 0x85ebca6b ^
+    config.filters * 131 ^
+    input.channels * 17 ^
+    kernelLength,
+  );
+  const weights = createConvolutionWeights(config, input.channels, random);
   return {
     id: config.id,
     trainable: config.trainable,

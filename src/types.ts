@@ -27,6 +27,7 @@ export interface ConvolutionConfig {
   id: string;
   enabled: boolean;
   trainable: boolean;
+  initialization: ConvolutionInitialization;
   position: number;
   order: number;
   filters: number;
@@ -36,6 +37,8 @@ export interface ConvolutionConfig {
   activation: ActivationKind;
   kernels: number[][];
 }
+
+export type ConvolutionInitialization = "he" | "template";
 
 export type PoolingKind = "max" | "average" | "globalAverage";
 
@@ -184,6 +187,7 @@ export interface TrainingProgress {
 }
 
 export interface TrainingTrace {
+  id: number;
   activations: number[][];
   gradients: number[][];
   convolutionWeights: number[][];

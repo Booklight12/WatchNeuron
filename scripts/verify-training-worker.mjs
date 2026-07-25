@@ -168,6 +168,7 @@ let sawValidTrace = false;
 let pauseRequested = false;
 let pauseVerified = false;
 let snapshotVerified = false;
+let lastTraceId = 0;
 let resumeVerified = false;
 let verificationStage = "activations";
 let baselineModel = null;
@@ -406,6 +407,7 @@ const completed = new Promise((resolvePromise, rejectPromise) => {
     }
 
     if (message.type === "trace") {
+      lastTraceId = message.id;
       wasmBackendVerified ||= message.backend?.startsWith("Zig/Wasm SIMD");
       const traceLayerIndex = verificationStage.startsWith("convolution") ? 2 : 1;
       const activations = Array.from(message.activations[traceLayerIndex]);
@@ -476,7 +478,9 @@ const completed = new Promise((resolvePromise, rejectPromise) => {
     }
 
     if (message.type === "paused") {
-      pauseVerified = true;
+      pauseVerified = Number.isInteger(message.traceId) &&
+        message.traceId > 0 &&
+        message.traceId === lastTraceId;
       worker.postMessage({ type: "snapshot" });
       return;
     }

@@ -2,7 +2,12 @@
 import { RotateCcw, Trash2 } from "@lucide/vue";
 import { computed, ref, watch } from "vue";
 import AppSelect, { type AppSelectOption, type AppSelectValue } from "./AppSelect.vue";
-import type { ActivationKind, ConvolutionConfig } from "../types";
+import SegmentedControl, { type SegmentedControlOption } from "./SegmentedControl.vue";
+import type {
+  ActivationKind,
+  ConvolutionConfig,
+  ConvolutionInitialization,
+} from "../types";
 import {
   convolutionKernelPresets,
   convolutionOutputShape,
@@ -32,6 +37,10 @@ const kernelSizeOptions: AppSelectOption[] = [1, 3, 5, 7].map((size) => ({
   value: size,
   label: `${size} × ${size}`,
 }));
+const initializationOptions: SegmentedControlOption[] = [
+  { value: "he", label: "独立 He" },
+  { value: "template", label: "模板引导" },
+];
 const filterOptions = computed<AppSelectOption[]>(() =>
   Array.from({ length: props.config.filters }, (_, index) => ({
     value: index,
@@ -129,6 +138,24 @@ function clearKernel() {
       </label>
     </div>
 
+    <div class="convolution-initialization-control">
+      <div>
+        <span>参数初始化</span>
+        <small v-if="config.initialization === 'he'">
+          每个输出通道、输入通道和核位置独立采样，边界按 fan_in 计算
+        </small>
+        <small v-else>
+          模板归一化后与独立 He 噪声混合，不会跨输入通道复制同一组权重
+        </small>
+      </div>
+      <SegmentedControl
+        :model-value="config.initialization"
+        :options="initializationOptions"
+        label="卷积参数初始化方式"
+        @update:model-value="updateConfig({ initialization: $event as ConvolutionInitialization })"
+      />
+    </div>
+
     <div class="convolution-settings">
         <label>
           <span>卷积核</span>
@@ -170,7 +197,7 @@ function clearKernel() {
       <small>{{ output.length.toLocaleString('zh-CN') }} 个激活</small>
     </div>
 
-    <div class="kernel-workbench">
+    <div v-if="config.initialization === 'template'" class="kernel-workbench">
       <div class="kernel-toolbar">
         <label>
           <span>编辑卷积核</span>

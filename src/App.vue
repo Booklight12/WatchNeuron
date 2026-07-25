@@ -222,6 +222,7 @@ function convolutionConfigFromLayer(layer: ConvolutionLayerData | null | undefin
     id: layer.id,
     enabled: true,
     trainable: layer.trainable !== false,
+    initialization: "he",
     position: Number.isFinite(layer.position) ? layer.position : 0,
     order: Number.isFinite(layer.order) ? layer.order : 0,
     filters: layer.filters,
@@ -307,7 +308,7 @@ function architectureSignature(
     layers: layers.map(({ units, activation, dropout }) => ({ units, activation, dropout })),
     convolutions: convolutionConfigs
       .filter((config) => config.enabled)
-      .map(({ position, order, filters, kernelSize, stride, padding, activation, kernels, trainable }) => ({
+      .map(({ position, order, filters, kernelSize, stride, padding, activation, kernels, trainable, initialization }) => ({
         position,
         order,
         filters,
@@ -317,6 +318,7 @@ function architectureSignature(
         activation,
         kernels,
         trainable,
+        initialization,
       })),
     poolings: poolingConfigs.map(({ position, order, kind, kernelSize, stride, padding }) => ({
       position, order, kind, kernelSize, stride, padding,
@@ -904,6 +906,7 @@ function startTraining(mode: TrainingMode = "scratch") {
     const message = event.data;
     if (message.type === "trace") {
       trainingTrace.value = {
+        id: Number.isFinite(message.id) ? message.id : 0,
         activations: message.activations.map((layer: ArrayLike<number>) => Array.from(layer)),
         gradients: message.gradients.map((layer: ArrayLike<number>) => Array.from(layer)),
         convolutionWeights: (message.convolutionWeights ?? []).map(
@@ -934,6 +937,13 @@ function startTraining(mode: TrainingMode = "scratch") {
       return;
     }
     if (message.type === "paused") {
+      if (
+        trainingTrace.value &&
+        Number.isFinite(message.traceId) &&
+        message.traceId !== trainingTrace.value.id
+      ) {
+        return;
+      }
       trainingProgress.value.phase = "paused";
       return;
     }
